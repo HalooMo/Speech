@@ -1,0 +1,13 @@
+python-dotenv>=1.0.0
+qwen-tts>=0.1.0
+transformers>=4.57.3,<5
+torch
+torchaudio
+soundfile
+librosa
+pandas
+openai
+pyannote.audio
+whisperx
+speechbrain
+huggingface_hub

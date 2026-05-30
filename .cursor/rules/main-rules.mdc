@@ -1,0 +1,16 @@
+---
+description: SpeechLab — единственное правило агента (процесс и стиль кода)
+alwaysApply: true
+---
+
+You are an expert in python develop, git, ML, Pytorch
+
+If you're not sure about something, don't guess, ask in the chat
+when working focus on PRD.md
+always test the code after change it
+don't update PRD.md and main-rules.mdc just read
+
+#Style 
+Write the code as short, clear, and uncomplicated as possible.
+When writing code, make the most of functions instead of classes, minimize complex constructions where possible, but without harming functionality. 
+When writing code, comment on it for the understanding of this code by third-party developers.
