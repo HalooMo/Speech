@@ -152,6 +152,23 @@ def dub_tts(
     return str(out_path.resolve())
 
 
+def dub_from_profile(
+    text: str,
+    language: str,
+    profile: dict,
+    out_path: str | Path,
+) -> str:
+    """Озвучка по профилю из casting.json."""
+    return dub_tts(
+        text=text,
+        language=language,
+        age=profile.get("age_group", "mature"),
+        gender=profile.get("gender", "male"),
+        emotion=profile.get("primary_emotion", "calm"),
+        out_path=out_path,
+    )
+
+
 def dub_from_voice_param(
     text: str,
     language: str,
@@ -159,14 +176,12 @@ def dub_from_voice_param(
     emotion: str | dict,
     out_path: str | Path,
 ) -> str:
-    """Озвучка по полям sex/emotion из voice_param.txt."""
+    """Совместимость: sex/emotion как JSON или dict → profile."""
     s = json.loads(sex) if isinstance(sex, str) else sex
     e = json.loads(emotion) if isinstance(emotion, str) else emotion
-    return dub_tts(
-        text=text,
-        language=language,
-        age=s.get("age_group", "mature"),
-        gender=s.get("gender", "male"),
-        emotion=e.get("primary_emotion", "calm"),
-        out_path=out_path,
-    )
+    profile = {
+        "age_group": s.get("age_group", "mature"),
+        "gender": s.get("gender", "male"),
+        "primary_emotion": e.get("primary_emotion", "calm"),
+    }
+    return dub_from_profile(text, language, profile, out_path)

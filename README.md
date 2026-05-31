@@ -25,16 +25,17 @@ flowchart TB
   subgraph secondary["3. На каждый сегмент"]
     F --> WX[Pyannote + WhisperX]
     WX --> LLM1[LLM: реплики и спикеры]
-    LLM1 --> VP[Признаки голоса: пол, возраст, эмоция]
-    VP --> LLM2[LLM: перевод под длину]
-    LLM2 --> TTS[Qwen3-TTS VoiceDesign]
-    TTS --> FIT[fit_audio ±5%, overlay]
+    LLM1 --> LLM2[LLM: перевод под длину]
+    LLM2 --> VP[casting.json: пол, возраст, эмоция]
+    VP --> TTS[Qwen3-TTS VoiceDesign]
+    TTS --> FIT[fit_audio ±5%, overlay разных спикеров]
     FIT --> R[restored.wav]
   end
 
   subgraph final["4. Финал"]
     R --> FULL[full_dub.wav + музыка]
-    FULL --> MUX[MP4 с дубляжом]
+    FULL --> MIX[+ оригинал видео ~30%]
+    MIX --> MUX[MP4]
   end
 ```
 
@@ -46,7 +47,7 @@ flowchart TB
 | Разметка и перевод | LLM (OpenAI-compatible API) |
 | Биометрия / эмоция | wav2vec2 ([age/gender](https://huggingface.co/audeering/wav2vec2-large-robust-24-ft-age-gender), [emotion](https://huggingface.co/Dpngtm/wav2vec2-emotion-recognition)) |
 | Озвучка | [Qwen3-TTS VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) |
-| Таймлайн | `fit_audio.py` (Rubber Band, до ±5%) |
+| Таймлайн | `fit_audio.py` (±5%, overlay только у разных спикеров) |
 
 ---
 
@@ -105,10 +106,13 @@ myfilm/
   demucs_stems/
   first_seg/
   full_dub.wav
+  final_mux_audio.wav
+  dub_output_path.txt
+  first_seg/.../second_seg/casting.json
   myfilm_dubbed.mp4
 ```
 
-Только разбор одного `vocals.wav` (без полного E2E):
+Тест вторичной разметки (PRD п. 3.1–3.2) — в начале `test.py` задайте `WAV_PATH`:
 
 ```bash
 python test.py
@@ -155,7 +159,9 @@ Speech/
 
 | Переменная | По умолчанию | Описание |
 |------------|--------------|----------|
-| `SPEECHLAB_MAX_PRIMARY_SEC` | `45` | Макс. длина первичного сегмента (сек) |
+| `SPEECHLAB_MIN_PRIMARY_SEC` | `40` | Мин. длина первичного сегмента (сек) |
+| `SPEECHLAB_MAX_PRIMARY_SEC` | `90` | Макс. длина первичного сегмента (сек) |
+| `SPEECHLAB_ORIGINAL_AUDIO_RATIO` | `0.3` | Доля оригинала видео в финальном миксе |
 | `SPEECHLAB_WHISPER_MODEL` | `large-v3` | Модель WhisperX |
 | `SPEECHLAB_COMPUTE_TYPE` | `float32` | `float16` на GPU для экономии VRAM |
 | `SPEECHLAB_MAX_WORDS_LLM` | `2800` | Лимит слов в одном запросе к LLM |
@@ -173,16 +179,9 @@ Speech/
 
 ---
 
-## Статус относительно PRD
+## Соответствие PRD
 
-| Требование PRD | Статус |
-|----------------|--------|
-| Demucs, первичная нарезка, вторичный пайплайн | реализовано |
-| LLM-разметка и перевод | реализовано |
-| Qwen3-TTS + fit ±5%, overlay | реализовано |
-| Первичные сегменты 40–90 с | в коде лимит ~45 с (`SPEECHLAB_MAX_PRIMARY_SEC`) |
-| Признаки в `dict` вместо `voice_param.txt` | в планах |
-| ~30% оригинального звука видео в финале | в планах |
+Поведение кода следует [`PRD.md`](PRD.md): первичка 40–90 с, `casting.json`, Qwen3-TTS, финальный микс `дубляж + оригинал×0.3`, путь к ролику в `dub_output_path.txt`. Склейка реплик — суммирование на таймлайне; наложение включается, если после fit ±5% реплика не влезает в слот **и** спикер сменился.
 
 ---
 

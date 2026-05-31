@@ -213,18 +213,18 @@ def patch_runtime(repo: Path, code_src: Path) -> None:
                 t = t.replace("from get_param import get_bio, get_emotion, get_sex\n", "", 1)
             if "from mk_voice import synth_voice\n" in t[:3000]:
                 t = t.replace("from mk_voice import synth_voice\n", "", 1)
-            if "from get_param import get_bio, get_emotion, get_sex" not in t:
+            if "from get_param import profile_from_wav" not in t:
                 t = t.replace(
-                    "def collect_voice_params(second_seg_dir: Path) -> Path:\n",
-                    "def collect_voice_params(second_seg_dir: Path) -> Path:\n"
-                    "    from get_param import get_bio, get_emotion, get_sex\n\n",
+                    "def build_casting(second_seg_dir: Path) -> dict:\n",
+                    "def build_casting(second_seg_dir: Path) -> dict:\n"
+                    "    from get_param import profile_from_wav, unload_model\n\n",
                     1,
                 )
-            if "from mk_voice import synth_voice" not in t:
+            if "from dubbing import dub_from_profile" not in t:
                 t = t.replace(
                     "def dub_segments(\n    second_seg_dir: Path,\n    target_lang: str,\n) -> Path:\n",
                     "def dub_segments(\n    second_seg_dir: Path,\n    target_lang: str,\n) -> Path:\n"
-                    "    from mk_voice import synth_voice\n\n",
+                    "    from dubbing import dub_from_profile, unload_model\n\n",
                     1,
                 )
             if t != orig:

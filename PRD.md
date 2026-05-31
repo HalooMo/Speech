@@ -25,7 +25,7 @@ implementation
     3) use LLM with appropriate prompt
     4) use dict when extarct age and gender(audeering/wav2vec2-large-robust-24-ft-age-gender), emotion(Dpngtm/wav2vec2-emotion-recognition) instead of voice_param.txt 
     5) use Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign for voicing with params gender(sex), age, emotion 
-    6) use ffmpeg for connecting second audio seg, do not cut the audio overlay it on top of each other if necessary and use fit_audio to increase and decrease audio length if necessary but no more than of 5% of the length
+    6) use ffmpeg for connecting second audio seg, do not cut the audio, overlay it on top of each other if speaker is different and if it is necessary and use fit_audio to increase and decrease audio length if necessary but no more than 5% of the length
 4) use ffmpeg for connecting first audio segs
 5) Use ffmpeg to add the final audio to the original audio video so that the volume of the original audio is about 30% of the volume of the final audio.
 6) return path text of target video

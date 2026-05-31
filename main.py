@@ -1,7 +1,8 @@
 """
-SpeechLab — полный пайплайн закадрового дубляжа.
+SpeechLab — закадровый дубляж по PRD.md.
 
 Точка входа: run(project_name, video_path, source_language, target_language)
+→ Path к {project}_dubbed.mp4 и dub_output_path.txt
 """
 from __future__ import annotations
 
@@ -121,21 +122,57 @@ def separate_stems(audio_wav: Path, stems_dir: Path) -> tuple[Path, Path]:
     return vocals, no_vocals
 
 
-MAX_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MAX_PRIMARY_SEC", "45"))
+MIN_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MIN_PRIMARY_SEC", "40"))
+MAX_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MAX_PRIMARY_SEC", "90"))
+ORIGINAL_AUDIO_RATIO = float(os.environ.get("SPEECHLAB_ORIGINAL_AUDIO_RATIO", "0.3"))
 
 
-def _refine_bounds(bounds: list[float], max_len: float) -> list[float]:
-    """Дробит слишком длинные интервалы (иначе LLM отказывается от огромного промпта)."""
+def _split_long_segment(
+    start: float, end: float, max_len: float,
+) -> list[tuple[float, float]]:
+    segs: list[tuple[float, float]] = []
+    s = start
+    while end - s > max_len:
+        segs.append((s, s + max_len))
+        s += max_len
+    if end > s + 0.05:
+        segs.append((s, end))
+    return segs
+
+
+def _adjust_primary_bounds(
+    bounds: list[float],
+    min_len: float,
+    max_len: float,
+) -> list[float]:
+    """PRD: первичные сегменты ~40–90 с (нарезка по паузам + слияние/деление)."""
     if len(bounds) < 2:
         return bounds
-    out = [bounds[0]]
-    for end in bounds[1:]:
-        start = out[-1]
-        while end - start > max_len:
-            start = start + max_len
-            out.append(start)
-        if end > out[-1] + 0.05:
-            out.append(end)
+    segs: list[tuple[float, float]] = []
+    for i in range(len(bounds) - 1):
+        segs.extend(_split_long_segment(bounds[i], bounds[i + 1], max_len))
+    changed = True
+    while changed:
+        changed = False
+        merged: list[tuple[float, float]] = []
+        i = 0
+        while i < len(segs):
+            s, e = segs[i]
+            while (e - s) < min_len and i + 1 < len(segs):
+                _, ne = segs[i + 1]
+                if ne - s <= max_len:
+                    e = ne
+                    i += 1
+                    changed = True
+                else:
+                    break
+            merged.append((s, e))
+            i += 1
+        segs = merged
+    out = [segs[0][0]]
+    for _, e in segs:
+        if e > out[-1] + 0.05:
+            out.append(e)
     return out
 
 
@@ -182,7 +219,8 @@ def split_primary_segments(
     + manifest.json
     """
     first_seg_dir.mkdir(parents=True, exist_ok=True)
-    bounds = _refine_bounds(detect_silence_boundaries(vocals_wav), MAX_PRIMARY_SEC)
+    raw_bounds = detect_silence_boundaries(vocals_wav)
+    bounds = _adjust_primary_bounds(raw_bounds, MIN_PRIMARY_SEC, MAX_PRIMARY_SEC)
     manifest = []
 
     for i in range(len(bounds) - 1):
@@ -241,15 +279,14 @@ def _list_speech_wav(audio_dir: Path) -> list[Path]:
     return sorted(files, key=lambda p: int(SPEECH_WAV.match(p.name).group(1)))
 
 
-def collect_voice_params(second_seg_dir: Path) -> Path:
-    """Пол и эмоция на каждую реплику → voice_param.txt."""
-    from get_param import get_emotion, get_sex
+def build_casting(second_seg_dir: Path) -> dict:
+    """Признаки голоса по репликам → casting.json (dict, PRD)."""
+    from get_param import profile_from_wav, unload_model
 
     audio_dir = second_seg_dir / "output_audio_segments"
     text_dir = second_seg_dir / "output_text_segments"
-    out_file = second_seg_dir / "voice_param.txt"
+    casting: dict = {"segments": {}}
 
-    lines = ["# voice_param.txt", "", "[segments]"]
     for txt in _list_speech_txt(text_dir):
         meta = _parse_speech_txt(txt)
         if not meta:
@@ -259,52 +296,31 @@ def collect_voice_params(second_seg_dir: Path) -> Path:
         if not wavs:
             continue
         wav = wavs[0]
-        lines.append(f"file=speech_{idx}.txt")
-        lines.append(f"speaker={meta['speaker']}")
-        lines.append(f"wav={wav.name}")
-        lines.append(f"start={meta['start']}")
-        lines.append(f"end={meta['end']}")
-        lines.append(f"sex={get_sex(str(wav))}")
-        lines.append(f"emotion={get_emotion(str(wav))}")
-        lines.append("")
+        casting["segments"][txt.name] = {
+            "file": txt.name,
+            "speaker": meta["speaker"],
+            "wav": wav.name,
+            "start": meta["start"],
+            "end": meta["end"],
+            "profile": profile_from_wav(wav),
+        }
 
-    out_file.write_text("\n".join(lines), encoding="utf-8")
-
-    from get_param import unload_model
-
+    out_path = second_seg_dir / "casting.json"
+    out_path.write_text(
+        json.dumps(casting, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     unload_model()
-    return out_file
+    return casting
 
 
-def _load_voice_params(vp_path: Path) -> dict[str, dict]:
-    """Сегменты по имени speech_NNN.txt → поля sex, emotion, …"""
-    text = vp_path.read_text(encoding="utf-8")
-    segments: dict[str, dict] = {}
-    section = None
-    cur_seg: dict = {}
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line == "[segments]":
-            section = "segments"
-            continue
-        if line == "[speakers]":
-            section = "speakers"
-            continue
-        if section != "segments" or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        if key == "file":
-            if cur_seg.get("file"):
-                segments[cur_seg["file"]] = cur_seg
-            cur_seg = {"file": val}
-        else:
-            cur_seg[key] = val
-    if cur_seg.get("file"):
-        segments[cur_seg["file"]] = cur_seg
-    return segments
+def _load_casting(second_seg_dir: Path) -> dict:
+    path = second_seg_dir / "casting.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Нет {path}. Запустите build_casting после разметки реплик."
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def translate_segments(
@@ -321,6 +337,7 @@ def translate_segments(
         if not meta or not meta["text"]:
             continue
         orig = meta["text"]
+        slot_sec = float(meta["end"]) - float(meta["start"])
         prom = prompt.get_prompt(
             2,
             {
@@ -329,6 +346,7 @@ def translate_segments(
                 "target_lang": target_lang,
                 "source_chars": len(orig),
                 "source_words": len(orig.split()),
+                "slot_sec": slot_sec,
             },
         )
         translated = (llm.llm_response(prom, json_only=False) or "").strip()
@@ -345,12 +363,10 @@ def dub_segments(
     second_seg_dir: Path,
     target_lang: str,
 ) -> Path:
-    from dubbing import dub_from_voice_param, unload_model
+    from dubbing import dub_from_profile, unload_model
 
-    vp_path = second_seg_dir / "voice_param.txt"
-    if not vp_path.is_file():
-        raise FileNotFoundError(f"Нет {vp_path}")
-    seg_params = _load_voice_params(vp_path)
+    casting = _load_casting(second_seg_dir)
+    seg_map = casting.get("segments", {})
     target_dir = second_seg_dir / "target_text"
     final_dir = second_seg_dir / "final_audio"
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -361,20 +377,18 @@ def dub_segments(
         meta = _parse_speech_txt(txt)
         if not meta:
             continue
-        params = seg_params.get(txt.name, {})
-        sex_raw = params.get("sex", "{}")
-        emo_raw = params.get("emotion", "{}")
+        seg = seg_map.get(txt.name, {})
+        profile = seg.get("profile", {})
 
         src_wav = second_seg_dir / "output_audio_segments"
         wav_match = list(src_wav.glob(f"speech_{int(SPEECH_TXT.match(txt.name).group(1)):03d}_*.wav"))
         ref_name = wav_match[0].stem if wav_match else txt.stem
 
         out_wav = final_dir / f"{ref_name}_dub.wav"
-        dub_from_voice_param(
+        dub_from_profile(
             text=meta["text"],
             language=tts_lang,
-            sex=sex_raw,
-            emotion=emo_raw,
+            profile=profile,
             out_path=out_wav,
         )
         slot = float(meta["end"]) - float(meta["start"])
@@ -388,7 +402,7 @@ def _build_timeline(
     placements: list[tuple[float, Path]],
     min_total_dur: float,
 ) -> np.ndarray:
-    """placements: (play_start, path) — полная длина WAV, без обрезки."""
+    """Суммирование реплик на таймлайне (overlay без обрезки WAV)."""
     max_end = float(min_total_dur)
     for play_start, path in placements:
         max_end = max(max_end, play_start + _audio_duration(path))
@@ -409,18 +423,22 @@ def _build_timeline(
         end_pos = pos + len(data)
         if end_pos > len(out):
             out = np.pad(out, (0, end_pos - len(out)))
-        out[pos:end_pos] = data
+        out[pos:end_pos] += data[: end_pos - pos]
+
+    peak = float(np.max(np.abs(out))) or 1.0
+    if peak > 1.0:
+        out = out / peak * 0.98
     return out
 
 
 def restore_primary_segment(primary_dir: Path) -> Path:
-    """Склейка final_audio: ±5% fit, сдвиг и наложение при переполнении слота."""
+    """Склейка final_audio: fit ±5%, overlay только у разных спикеров (PRD)."""
     from fit_audio import schedule_placements
 
     second_root = primary_dir / "second_seg"
     seg_wav = primary_dir / "segment.wav"
     total_dur = _audio_duration(seg_wav)
-    slots: list[tuple[float, float, Path]] = []
+    slots: list[tuple[float, float, Path, str]] = []
 
     if second_root.is_dir():
         final_dir = second_root / "final_audio"
@@ -435,7 +453,12 @@ def restore_primary_segment(primary_dir: Path) -> Path:
                 if not dub:
                     dub = list(final_dir.glob(f"*{txt.stem}*_dub.wav"))
                 if dub:
-                    slots.append((meta["start"], meta["end"], dub[0]))
+                    slots.append((
+                        meta["start"],
+                        meta["end"],
+                        dub[0],
+                        meta["speaker"],
+                    ))
 
     if not slots:
         data, _ = sf.read(seg_wav, dtype="float32")
@@ -510,6 +533,71 @@ def restore_full_vocals(
     return out
 
 
+def _resample_mono(data: np.ndarray, sr: int, target_sr: int = SR) -> np.ndarray:
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if sr == target_sr:
+        return data.astype(np.float32)
+    import torch
+    import torchaudio
+
+    t = torch.from_numpy(data.astype(np.float32)).unsqueeze(0)
+    t = torchaudio.functional.resample(t, sr, target_sr)
+    return t.squeeze(0).numpy()
+
+
+def extract_original_audio_16k(video_path: Path, out_wav: Path) -> None:
+    """Оригинальная звуковая дорожка видео → mono 16 kHz."""
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    _run([
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-acodec", "pcm_s16le", "-ar", str(SR), "-ac", "1",
+        str(out_wav),
+    ])
+
+
+def mix_dub_with_original(
+    video_path: Path,
+    dub_wav: Path,
+    out_wav: Path,
+    *,
+    original_ratio: float | None = None,
+) -> Path:
+    """PRD: финальная дорожка = дубляж + ~30% оригинала из видео."""
+    ratio = ORIGINAL_AUDIO_RATIO if original_ratio is None else original_ratio
+    if not _has_video_stream(video_path):
+        import shutil
+        shutil.copy2(dub_wav, out_wav)
+        return out_wav
+
+    orig_tmp = out_wav.parent / "_original_16k.wav"
+    extract_original_audio_16k(video_path, orig_tmp)
+
+    dub_data, dub_sr = sf.read(dub_wav, dtype="float32")
+    orig_data, orig_sr = sf.read(orig_tmp, dtype="float32")
+    dub = _resample_mono(dub_data, dub_sr)
+    orig = _resample_mono(orig_data, orig_sr)
+
+    n = max(len(dub), len(orig))
+    if len(dub) < n:
+        dub = np.pad(dub, (0, n - len(dub)))
+    if len(orig) < n:
+        orig = np.pad(orig, (0, n - len(orig)))
+    else:
+        orig = orig[:n]
+        dub = dub[:n]
+
+    mixed = dub + orig * ratio
+    peak = float(np.max(np.abs(mixed))) or 1.0
+    if peak > 1.0:
+        mixed = mixed / peak * 0.98
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(out_wav, mixed.astype(np.float32), SR)
+    print(f"  микс: дубляж + оригинал × {ratio:.2f}")
+    return out_wav
+
+
 def mux_video(video_path: Path, audio_path: Path, out_path: Path) -> Path:
     """Склейка видео+аудио. Если вход только аудио (.wav) — MP4 с чёрным кадром."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -580,7 +668,7 @@ def run(
     first_seg_dir = project_dir / "first_seg"
     manifest = split_primary_segments(project_vocals, first_seg_dir)
 
-    print("=== 3. Вторичные сегменты (test.py) ===")
+    print("=== 3. Вторичные сегменты (PRD: pyannote + WhisperX + LLM) ===")
     for item in manifest:
         primary_dir = first_seg_dir / item["folder"]
         seg_wav = primary_dir / "segment.wav"
@@ -596,25 +684,31 @@ def run(
             hf_token=token,
         )
 
-        print("=== 4. voice_param.txt ===")
-        collect_voice_params(second_seg)
-
-        print("=== 5. Перевод → target_text ===")
+        print("=== 4. Перевод (LLM, длина ≈ слот) ===")
         translate_segments(second_seg, source_language, target_language)
 
-        print("=== 6. Озвучка → final_audio (fit ±5% при сборке) ===")
+        print("=== 5. casting.json (dict: пол, возраст, эмоция) ===")
+        build_casting(second_seg)
+
+        print("=== 6. Qwen3-TTS → final_audio ===")
         dub_segments(second_seg, target_language)
 
-        print(f"=== 7. Сборка первичного {item['folder']} ===")
+        print(f"=== 7. Склейка реплик (fit ±5%, overlay разных спикеров) ===")
         restore_primary_segment(primary_dir)
 
-    print("=== 7b. Полная дорожка + музыка ===")
+    print("=== 8. Первичные сегменты + музыка → full_dub.wav ===")
     full_audio = restore_full_vocals(project_dir, manifest, music_stem)
 
-    print("=== 8. Видео ===")
+    print("=== 9. Оригинал видео ~30% + mux MP4 ===")
+    mux_audio = project_dir / "final_mux_audio.wav"
+    mix_dub_with_original(video_path, full_audio, mux_audio)
     out_video = project_dir / f"{project_name}_dubbed.mp4"
-    mux_video(video_path, full_audio, out_video)
+    mux_video(video_path, mux_audio, out_video)
+
+    path_file = project_dir / "dub_output_path.txt"
+    path_file.write_text(str(out_video.resolve()), encoding="utf-8")
     print(f"Готово: {out_video}")
+    print(f"Путь (PRD): {path_file}")
     return out_video
 
 

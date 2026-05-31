@@ -1,4 +1,4 @@
-"""Подгонка длины: макс. ±5% stretch; иначе сдвиг/наложение на таймлайне."""
+"""Подгонка длины: макс. ±5% stretch; сдвиг/наложение по PRD (разные спикеры)."""
 from __future__ import annotations
 
 import os
@@ -6,14 +6,20 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import soundfile as sf
 
 DEFAULT_SR = 16000
-# Допустимое отклонение tempo от 1.0 (5% → tempo в [0.95, 1.05])
 MAX_STRETCH = float(os.environ.get("SPEECHLAB_MAX_STRETCH", "0.05"))
 _rubberband_ready: bool | None = None
+
+# (slot_start, slot_end, wav_path) или (+ speaker)
+SegmentSlot = Union[
+    tuple[float, float, Path],
+    tuple[float, float, Path, str],
+]
 
 
 def _find_rubberband() -> str | None:
@@ -92,10 +98,7 @@ def apply_limited_fit(
     sr: int = DEFAULT_SR,
     max_stretch: float | None = None,
 ) -> float:
-    """
-    Подогнать озвучку к слоту не более чем на ±max_stretch (по умолчанию 5%).
-    Возвращает фактическую длительность WAV (может быть > slot_sec).
-    """
+    """Подогнать озвучку к слоту не более чем на ±max_stretch (по умолчанию 5%)."""
     limit = MAX_STRETCH if max_stretch is None else max_stretch
     t_min, t_max = 1.0 - limit, 1.0 + limit
 
@@ -114,75 +117,87 @@ def apply_limited_fit(
     if abs(clamped - 1.0) < 0.005:
         return actual
 
-    out_dur = actual / clamped
-    tmp_in = in_path
-    cleanup: list[Path] = []
     fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="speechlab_fit_")
     os.close(fd)
     tmp_out = Path(tmp_name)
-    cleanup.append(tmp_out)
-
-    _stretch_file(tmp_in, clamped, tmp_out, y, int(file_sr))
+    _stretch_file(in_path, clamped, tmp_out, y, int(file_sr))
     shutil.move(tmp_out, in_path)
-    for p in cleanup:
-        p.unlink(missing_ok=True)
+    tmp_out.unlink(missing_ok=True)
 
     return read_duration(in_path, sr)
 
 
+def _normalize_slot(seg: SegmentSlot) -> tuple[float, float, Path, str]:
+    if len(seg) == 3:
+        return float(seg[0]), float(seg[1]), Path(seg[2]), ""
+    return float(seg[0]), float(seg[1]), Path(seg[2]), str(seg[3]).strip()
+
+
 def schedule_placements(
-    segments: list[tuple[float, float, Path]],
+    segments: list[SegmentSlot],
     *,
     max_stretch: float | None = None,
 ) -> list[tuple[float, Path]]:
     """
-    segments: (slot_start, slot_end, dub_wav) по порядку реплик.
-
-    1) На каждый WAV — apply_limited_fit (±5%).
-    2) play_start = max(slot_start, конец предыдущего) — отодвигание.
-    3) Если после fit длина > слота — следующий сегмент с slot_start предыдущей (наложение).
+    PRD: не обрезать WAV; fit ±5%; наложение только если спикер другой и реплика
+    не влезает в слот после fit. Один спикер — сдвиг (без overlay).
     """
     if not segments:
         return []
 
     prepared: list[dict] = []
-    for slot_start, slot_end, path in sorted(segments, key=lambda x: x[0]):
-        slot_dur = float(slot_end) - float(slot_start)
+    for raw in segments:
+        slot_start, slot_end, path, speaker = _normalize_slot(raw)
+        slot_dur = slot_end - slot_start
         dur = apply_limited_fit(path, slot_dur, max_stretch=max_stretch)
         prepared.append({
-            "slot_start": float(slot_start),
-            "slot_end": float(slot_end),
+            "slot_start": slot_start,
+            "slot_end": slot_end,
             "slot_dur": slot_dur,
-            "path": Path(path),
+            "path": path,
             "dur": dur,
+            "speaker": speaker,
         })
+    prepared.sort(key=lambda x: x["slot_start"])
 
     placements: list[tuple[float, Path]] = []
     cursor_end = 0.0
     overlap_at: float | None = None
+    prev_speaker: str | None = None
 
     for item in prepared:
         slot_start = item["slot_start"]
         path = item["path"]
         dur = item["dur"]
         slot_dur = item["slot_dur"]
+        speaker = item["speaker"]
+
+        overflow = dur > slot_dur + 0.02
+        allow_overlap = (
+            overflow
+            and prev_speaker is not None
+            and speaker
+            and prev_speaker != speaker
+        )
 
         if overlap_at is not None:
             play_start = overlap_at
             overlap_at = None
+        elif allow_overlap:
+            play_start = slot_start
         else:
             play_start = max(slot_start, cursor_end)
 
         placements.append((play_start, path))
         cursor_end = play_start + dur
+        prev_speaker = speaker or prev_speaker
 
-        if dur > slot_dur + 0.02:
+        if allow_overlap:
             overlap_at = slot_start
 
     return placements
 
 
-# Совместимость со старым вызовом (только ±5% fit, без сдвига таймлайна)
 def fit_to_duration(
     wav_path: str | Path,
     target_sec: float,

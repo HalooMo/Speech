@@ -1,4 +1,4 @@
-"""Пол и эмоция по WAV реплики (wav2vec2). JSON-строки для voice_param.txt."""
+"""Пол, возраст и эмоция по WAV реплики (wav2vec2) → dict для casting."""
 from __future__ import annotations
 
 import json
@@ -145,10 +145,31 @@ def _predict_age_gender(audio_np: np.ndarray, input_sr: int = 16000) -> dict:
     }
 
 
+def profile_from_wav(audio_path: str | os.PathLike) -> dict:
+    """Профиль реплики для casting.json и TTS."""
+    audio = load_audio_16k(audio_path)
+    ag = _predict_age_gender(audio)
+    scores = _predict_emotion_scores(audio)
+    raw_label = scores[0][0] if scores else "neutral"
+    primary = _EMOTION_TO_DUB.get(raw_label, raw_label)
+    if primary not in ("calm", "sad", "disgust", "happy", "angry"):
+        primary = "calm"
+    return {
+        "gender": ag["gender"],
+        "age_group": ag["age_group"],
+        "age": ag["age"],
+        "confidence_gender": ag["confidence"],
+        "gender_probs": ag["probs"],
+        "primary_emotion": primary,
+        "raw_emotion_label": raw_label,
+        "confidence_emotion": scores[0][1] if scores else 0.0,
+        "emotion_scores": [{"label": l, "prob": p} for l, p in scores],
+    }
+
+
 def get_sex(audio_path: str) -> str:
     """JSON: gender, age_group, age, confidence, probs."""
-    audio = load_audio_16k(audio_path)
-    return json.dumps(_predict_age_gender(audio), ensure_ascii=False)
+    return json.dumps(_predict_age_gender(load_audio_16k(audio_path)), ensure_ascii=False)
 
 
 def get_emotion(audio_path: str) -> str:

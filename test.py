@@ -1,4 +1,4 @@
-"""Анализ одного аудиофрагмента: diarization → WhisperX → LLM → нарезка сегментов."""
+"""PRD п. 3.1–3.2: pyannote + WhisperX → LLM → output_audio/text_segments."""
 from __future__ import annotations
 
 import ast
@@ -6,6 +6,14 @@ import json
 import os
 import re
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+# --- настройки локального теста (python test.py) ---
+WAV_PATH = ROOT / "vocals.wav"
+SOURCE_LANG = "en"
+OUTPUT_AUDIO_DIR = ROOT / "output_audio_segments"
+OUTPUT_TEXT_DIR = ROOT / "output_text_segments"
 
 import llm
 import pandas as pd
@@ -87,10 +95,7 @@ def run_segment_pipeline(
     hf_token: str | None = None,
     clear_outputs: bool = True,
 ) -> list[dict]:
-    """
-  Полный пайплайн test.py для одного WAV (16 kHz mono).
-  Возвращает список speech-сегментов от LLM.
-    """
+    """Один WAV (16 kHz mono): diarization → WhisperX → LLM → output_*."""
     token = hf_token or get_hf_token()
 
     audio_path = Path(audio_path)
@@ -194,14 +199,34 @@ def run_segment_pipeline(
     return final_segments
 
 
-if __name__ == "__main__":
-    from pathlib import Path as P
+def run_test() -> list[dict]:
+    """Локальный прогон: пути и язык — константы в начале файла."""
+    audio = Path(WAV_PATH).resolve()
+    if not audio.is_file():
+        raise FileNotFoundError(f"WAV не найден: {audio}")
 
-    root = P(__file__).resolve().parent
-    run_segment_pipeline(
-        root / "vocals.wav",
-        root / "output_audio_segments",
-        root / "output_text_segments",
-        "en",
+    print(f"Вход: {audio}")
+    print(f"Язык: {SOURCE_LANG}")
+    print(f"WAV → {Path(OUTPUT_AUDIO_DIR).resolve()}")
+    print(f"TXT → {Path(OUTPUT_TEXT_DIR).resolve()}")
+
+    segments = run_segment_pipeline(
+        audio,
+        OUTPUT_AUDIO_DIR,
+        OUTPUT_TEXT_DIR,
+        SOURCE_LANG,
         hf_token=get_hf_token(),
     )
+
+    print(f"\nГотово: {len(segments)} реплик")
+    for i, seg in enumerate(segments, 1):
+        print(
+            f"  {i:3d}  {seg['speaker']:3s}  "
+            f"{float(seg['start']):7.2f}-{float(seg['end']):7.2f}s  "
+            f"{(seg.get('text') or '')[:60]}"
+        )
+    return segments
+
+
+if __name__ == "__main__":
+    run_test()
