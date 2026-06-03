@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import ast
+import gc
 import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 
@@ -31,6 +33,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_TYPE = os.environ.get("SPEECHLAB_COMPUTE_TYPE", "float32")
 WHISPER_MODEL = os.environ.get("SPEECHLAB_WHISPER_MODEL", "large-v3")
 MAX_WORDS_LLM = int(os.environ.get("SPEECHLAB_MAX_WORDS_LLM", "2800"))
+
+_asr: dict[str, Any] = {
+    "lang": None,
+    "diarization": None,
+    "whisper": None,
+    "align_model": None,
+    "align_meta": None,
+}
 
 
 def clear_directory(path: Path) -> None:
@@ -86,6 +96,50 @@ def cut_audio_samples(audio, sr: int, start: float, end: float):
     return audio[s:e]
 
 
+def init_asr_models(source_language: str, hf_token: str | None = None) -> None:
+    """Загрузить pyannote + WhisperX один раз на язык (P0: переиспользование между first_seg)."""
+    token = hf_token or get_hf_token()
+    lang = source_language.strip().lower()
+    if (
+        _asr["lang"] == lang
+        and _asr["diarization"] is not None
+        and _asr["whisper"] is not None
+    ):
+        return
+
+    unload_asr_models()
+    login(token=token)
+    print(f"  ASR: загрузка моделей ({lang}, whisper={WHISPER_MODEL})…")
+    _asr["lang"] = lang
+    _asr["diarization"] = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-community-1",
+        token=token,
+    ).to(torch.device(DEVICE))
+    _asr["whisper"] = whisperx.load_model(
+        WHISPER_MODEL,
+        DEVICE,
+        compute_type=COMPUTE_TYPE,
+        language=source_language,
+        vad_method="silero",
+    )
+    _asr["align_model"], _asr["align_meta"] = whisperx.load_align_model(
+        language_code=source_language,
+        device=DEVICE,
+    )
+
+
+def unload_asr_models() -> None:
+    """Освободить VRAM после всех первичных сегментов."""
+    _asr["lang"] = None
+    _asr["diarization"] = None
+    _asr["whisper"] = None
+    _asr["align_model"] = None
+    _asr["align_meta"] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def run_segment_pipeline(
     audio_path: str | Path,
     output_audio_dir: str | Path,
@@ -94,10 +148,10 @@ def run_segment_pipeline(
     *,
     hf_token: str | None = None,
     clear_outputs: bool = True,
+    reuse_asr: bool = True,
 ) -> list[dict]:
     """Один WAV (16 kHz mono): diarization → WhisperX → LLM → output_*."""
     token = hf_token or get_hf_token()
-
     audio_path = Path(audio_path)
     output_audio_dir = Path(output_audio_dir)
     output_text_dir = Path(output_text_dir)
@@ -109,22 +163,18 @@ def run_segment_pipeline(
         output_audio_dir.mkdir(parents=True, exist_ok=True)
         output_text_dir.mkdir(parents=True, exist_ok=True)
 
-    login(token=token)
+    if reuse_asr:
+        init_asr_models(source_language, token)
+    else:
+        unload_asr_models()
+        init_asr_models(source_language, token)
 
-    diarization = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-community-1",
-        token=token,
-    ).to(torch.device(DEVICE))
+    diarization = _asr["diarization"]
+    whisper = _asr["whisper"]
+    align_model = _asr["align_model"]
+    align_meta = _asr["align_meta"]
 
-    whisper = whisperx.load_model(
-        WHISPER_MODEL,
-        DEVICE,
-        compute_type=COMPUTE_TYPE,
-        language=source_language,
-        vad_method="silero",
-    )
     audio = whisperx.load_audio(str(audio_path))
-
     waveform, sample_rate = torchaudio.load(str(audio_path))
     diar_result = diarization({"waveform": waveform, "sample_rate": sample_rate})
 
@@ -139,9 +189,6 @@ def run_segment_pipeline(
     diarize_df = pd.DataFrame(raw_segments)
 
     transcript = whisper.transcribe(audio, batch_size=4)
-    align_model, align_meta = whisperx.load_align_model(
-        language_code=source_language, device=DEVICE
-    )
     transcript = whisperx.align(
         transcript["segments"],
         align_model,
@@ -210,13 +257,17 @@ def run_test() -> list[dict]:
     print(f"WAV → {Path(OUTPUT_AUDIO_DIR).resolve()}")
     print(f"TXT → {Path(OUTPUT_TEXT_DIR).resolve()}")
 
-    segments = run_segment_pipeline(
-        audio,
-        OUTPUT_AUDIO_DIR,
-        OUTPUT_TEXT_DIR,
-        SOURCE_LANG,
-        hf_token=get_hf_token(),
-    )
+    try:
+        segments = run_segment_pipeline(
+            audio,
+            OUTPUT_AUDIO_DIR,
+            OUTPUT_TEXT_DIR,
+            SOURCE_LANG,
+            hf_token=get_hf_token(),
+            reuse_asr=False,
+        )
+    finally:
+        unload_asr_models()
 
     print(f"\nГотово: {len(segments)} реплик")
     for i, seg in enumerate(segments, 1):

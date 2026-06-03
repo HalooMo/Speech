@@ -19,7 +19,7 @@ import prompt
 import soundfile as sf
 
 from env_config import get_hf_token
-from test import run_segment_pipeline
+from test import init_asr_models, run_segment_pipeline, unload_asr_models
 
 ROOT = Path(__file__).resolve().parent
 SR = 16000
@@ -314,13 +314,43 @@ def build_casting(second_seg_dir: Path) -> dict:
     return casting
 
 
-def _load_casting(second_seg_dir: Path) -> dict:
-    path = second_seg_dir / "casting.json"
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Нет {path}. Запустите build_casting после разметки реплик."
-        )
-    return json.loads(path.read_text(encoding="utf-8"))
+TRANSLATE_BATCH_SIZE = int(os.environ.get("SPEECHLAB_TRANSLATE_BATCH_SIZE", "12"))
+
+
+def _parse_batch_translations(raw: str) -> list[dict]:
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```\s*$", "", s).strip()
+    start, end = s.find("["), s.rfind("]")
+    if start != -1 and end > start:
+        s = s[start : end + 1]
+    data = json.loads(s)
+    if not isinstance(data, list):
+        raise ValueError("Ожидался JSON-массив переводов")
+    return data
+
+
+def _translate_one(
+    meta: dict,
+    txt_name: str,
+    source_lang: str,
+    target_lang: str,
+) -> str:
+    orig = meta["text"]
+    slot_sec = float(meta["end"]) - float(meta["start"])
+    prom = prompt.get_prompt(
+        2,
+        {
+            "text": orig,
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "source_chars": len(orig),
+            "source_words": len(orig.split()),
+            "slot_sec": slot_sec,
+        },
+    )
+    return (llm.llm_response(prom, json_only=False) or "").strip()
 
 
 def translate_segments(
@@ -332,46 +362,89 @@ def translate_segments(
     target_dir = second_seg_dir / "target_text"
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    entries: list[tuple[Path, dict]] = []
     for txt in _list_speech_txt(text_dir):
         meta = _parse_speech_txt(txt)
-        if not meta or not meta["text"]:
-            continue
-        orig = meta["text"]
-        slot_sec = float(meta["end"]) - float(meta["start"])
-        prom = prompt.get_prompt(
-            2,
-            {
+        if meta and meta["text"]:
+            entries.append((txt, meta))
+
+    for i in range(0, len(entries), TRANSLATE_BATCH_SIZE):
+        batch = entries[i : i + TRANSLATE_BATCH_SIZE]
+        lines = []
+        for txt, meta in batch:
+            orig = meta["text"]
+            slot_sec = float(meta["end"]) - float(meta["start"])
+            lines.append({
+                "id": txt.name,
                 "text": orig,
-                "source_lang": source_lang,
-                "target_lang": target_lang,
                 "source_chars": len(orig),
                 "source_words": len(orig.split()),
-                "slot_sec": slot_sec,
-            },
-        )
-        translated = (llm.llm_response(prom, json_only=False) or "").strip()
-        out = target_dir / txt.name
-        out.write_text(
-            f"{meta['start']:.2f} - {meta['end']:.2f}\n{meta['speaker']}\n{translated}",
-            encoding="utf-8",
-        )
-        print(f"  перевод {txt.name}")
+                "slot_sec": round(slot_sec, 2),
+            })
+
+        by_id: dict[str, str] = {}
+        try:
+            prom = prompt.get_prompt(
+                3,
+                {
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
+                    "lines": lines,
+                },
+            )
+            raw = llm.llm_response_retry(
+                prom,
+                json_only=False,
+                batch_translate=True,
+                retries=2,
+                retry_suffix='Return ONLY JSON array [{"id":"...","text":"..."}]',
+            )
+            for item in _parse_batch_translations(raw):
+                rid = str(item.get("id", "")).strip()
+                text = str(item.get("text", "")).strip()
+                if rid and text:
+                    by_id[rid] = text
+        except Exception as exc:
+            print(f"  batch перевод не удался ({exc}), по одной реплике…")
+
+        for txt, meta in batch:
+            translated = by_id.get(txt.name)
+            if not translated:
+                translated = _translate_one(meta, txt.name, source_lang, target_lang)
+            out = target_dir / txt.name
+            out.write_text(
+                f"{meta['start']:.2f} - {meta['end']:.2f}\n{meta['speaker']}\n{translated}",
+                encoding="utf-8",
+            )
+        print(f"  перевод batch {i // TRANSLATE_BATCH_SIZE + 1} ({len(batch)} реплик)")
+
     return target_dir
+
+
+def _load_casting(second_seg_dir: Path) -> dict:
+    path = second_seg_dir / "casting.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Нет {path}. Запустите build_casting после разметки реплик."
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def dub_segments(
     second_seg_dir: Path,
     target_lang: str,
 ) -> Path:
-    from dubbing import dub_from_profile, unload_model
+    from dubbing import dub_from_profile, ensure_voice_bank, unload_model
+
+    tts_lang = _tts_language(target_lang)
+    print("  TTS: банк 8 голосов (Design → Base clone)…")
+    ensure_voice_bank(tts_lang)
 
     casting = _load_casting(second_seg_dir)
     seg_map = casting.get("segments", {})
     target_dir = second_seg_dir / "target_text"
     final_dir = second_seg_dir / "final_audio"
     final_dir.mkdir(parents=True, exist_ok=True)
-
-    tts_lang = _tts_language(target_lang)
 
     for txt in _list_speech_txt(target_dir):
         meta = _parse_speech_txt(txt)
@@ -432,7 +505,7 @@ def _build_timeline(
 
 
 def restore_primary_segment(primary_dir: Path) -> Path:
-    """Склейка final_audio: fit ±5%, overlay только у разных спикеров (PRD)."""
+    """Склейка final_audio: fit ±10%, overlay только у разных спикеров (PRD)."""
     from fit_audio import schedule_placements
 
     second_root = primary_dir / "second_seg"
@@ -669,32 +742,37 @@ def run(
     manifest = split_primary_segments(project_vocals, first_seg_dir)
 
     print("=== 3. Вторичные сегменты (PRD: pyannote + WhisperX + LLM) ===")
-    for item in manifest:
-        primary_dir = first_seg_dir / item["folder"]
-        seg_wav = primary_dir / "segment.wav"
-        second_seg = primary_dir / "second_seg"
-        second_seg.mkdir(parents=True, exist_ok=True)
+    init_asr_models(source_language, token)
+    try:
+        for item in manifest:
+            primary_dir = first_seg_dir / item["folder"]
+            seg_wav = primary_dir / "segment.wav"
+            second_seg = primary_dir / "second_seg"
+            second_seg.mkdir(parents=True, exist_ok=True)
 
-        print(f"--- Первичный {item['folder']} ---")
-        run_segment_pipeline(
-            seg_wav,
-            second_seg / "output_audio_segments",
-            second_seg / "output_text_segments",
-            source_language,
-            hf_token=token,
-        )
+            print(f"--- Первичный {item['folder']} ---")
+            run_segment_pipeline(
+                seg_wav,
+                second_seg / "output_audio_segments",
+                second_seg / "output_text_segments",
+                source_language,
+                hf_token=token,
+                reuse_asr=True,
+            )
 
-        print("=== 4. Перевод (LLM, длина ≈ слот) ===")
-        translate_segments(second_seg, source_language, target_language)
+            print("=== 4. Перевод (LLM batch, длина ≈ слот) ===")
+            translate_segments(second_seg, source_language, target_language)
 
-        print("=== 5. casting.json (dict: пол, возраст, эмоция) ===")
-        build_casting(second_seg)
+            print("=== 5. casting.json (dict: пол, возраст) ===")
+            build_casting(second_seg)
 
-        print("=== 6. Qwen3-TTS → final_audio ===")
-        dub_segments(second_seg, target_language)
+            print("=== 6. Qwen3-TTS → final_audio ===")
+            dub_segments(second_seg, target_language)
 
-        print(f"=== 7. Склейка реплик (fit ±5%, overlay разных спикеров) ===")
-        restore_primary_segment(primary_dir)
+            print("=== 7. Склейка реплик (fit ±10%, overlay разных спикеров) ===")
+            restore_primary_segment(primary_dir)
+    finally:
+        unload_asr_models()
 
     print("=== 8. Первичные сегменты + музыка → full_dub.wav ===")
     full_audio = restore_full_vocals(project_dir, manifest, music_stem)

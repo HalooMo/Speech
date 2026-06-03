@@ -16,10 +16,10 @@ from pathlib import Path
 
 # ========================= НАСТРОЙКИ ==========================================
 PROJECT_NAME = "kaggle_dub"
-VIDEO_PATH = "/kaggle/input/datasets/salimkazhaerov/speechlab_five/diolog.mp4"
+VIDEO_PATH = "/kaggle/input/datasets/salimkazhaerov/speechlab-ten/diolog.mp4"
 SOURCE_LANG = "en"
 TARGET_LANG = "ru"
-CODE_DATASET_PATH = "/kaggle/input/datasets/salimkazhaerov/speechlab_five"
+CODE_DATASET_PATH = "/kaggle/input/datasets/salimkazhaerov/speechlab-ten"
 USE_GIT = False
 GIT_URL = ""
 SKIP_DEMUCS = False
@@ -135,12 +135,12 @@ def _find_code_source() -> Path:
     if CODE_DATASET_PATH:
         candidates.append(Path(CODE_DATASET_PATH))
     candidates.extend([
-        Path("/kaggle/input/speechlab_five"),
-        Path("/kaggle/input/datasets/salimkazhaerov/speechlab_five"),
+        Path("/kaggle/input/speechlab-ten"),
+        Path("/kaggle/input/datasets/salimkazhaerov/speechlab-ten"),
     ])
     for base in Path("/kaggle/input").glob("*"):
         candidates.append(base)
-        candidates.append(base / "speechlab_five")
+        candidates.append(base / "speechlab-ten")
 
     seen: set[str] = set()
     for p in candidates:
@@ -380,6 +380,7 @@ def run_pipeline_subprocess(repo: Path) -> Path:
     _write_child_script(repo, use_ke)
     env = os.environ.copy()
     video_path = _resolve_video_path()
+    voice_cache = WORK / "speechlab_voice_bank"
     env.update({
         "SPEECHLAB_REPO": str(repo),
         "SPEECHLAB_WORK": str(WORK),
@@ -391,6 +392,8 @@ def run_pipeline_subprocess(repo: Path) -> Path:
         "SPEECHLAB_SKIP_DEMUCS": "1" if SKIP_DEMUCS else "0",
         "SPEECHLAB_WHISPER_MODEL": WHISPER_MODEL,
         "SPEECHLAB_COMPUTE_TYPE": COMPUTE_TYPE,
+        "SPEECHLAB_VOICE_CACHE": str(voice_cache),
+        "SPEECHLAB_TRANSLATE_BATCH_SIZE": os.environ.get("SPEECHLAB_TRANSLATE_BATCH_SIZE", "12"),
     })
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     (WORK / "hf_cache").mkdir(parents=True, exist_ok=True)

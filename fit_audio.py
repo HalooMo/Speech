@@ -1,4 +1,4 @@
-"""Подгонка длины: макс. ±5% stretch; сдвиг/наложение по PRD (разные спикеры)."""
+"""Подгонка длины: макс. ±10% stretch; сдвиг/наложение по PRD (разные спикеры)."""
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ import numpy as np
 import soundfile as sf
 
 DEFAULT_SR = 16000
-MAX_STRETCH = float(os.environ.get("SPEECHLAB_MAX_STRETCH", "0.05"))
+MAX_STRETCH = float(os.environ.get("SPEECHLAB_MAX_STRETCH", "0.10"))
 _rubberband_ready: bool | None = None
 
 # (slot_start, slot_end, wav_path) или (+ speaker)
@@ -98,7 +98,7 @@ def apply_limited_fit(
     sr: int = DEFAULT_SR,
     max_stretch: float | None = None,
 ) -> float:
-    """Подогнать озвучку к слоту не более чем на ±max_stretch (по умолчанию 5%)."""
+    """Подогнать озвучку к слоту не более чем на ±max_stretch (по умолчанию 10%)."""
     limit = MAX_STRETCH if max_stretch is None else max_stretch
     t_min, t_max = 1.0 - limit, 1.0 + limit
 
@@ -139,7 +139,7 @@ def schedule_placements(
     max_stretch: float | None = None,
 ) -> list[tuple[float, Path]]:
     """
-    PRD: не обрезать WAV; fit ±5%; наложение только если спикер другой и реплика
+    PRD: не обрезать WAV; fit ±10%; наложение только если спикер другой и реплика
     не влезает в слот после fit. Один спикер — сдвиг (без overlay).
     """
     if not segments:

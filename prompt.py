@@ -1,5 +1,6 @@
-# type==1: value = word_segments (list[dict])
-# type==2: value = dict с text, source_lang, target_lang, source_chars, source_words, slot_sec
+# type==1: word_segments (list[dict])
+# type==2: dict — одна реплика
+# type==3: dict — batch: source_lang, target_lang, lines: [{id, text, ...}]
 
 import json
 
@@ -26,7 +27,7 @@ def get_prompt(type, value):
         if slot_sec is not None and float(slot_sec) > 0:
             slot_line = (
                 f"\nThe dubbed line must fit ~{float(slot_sec):.2f}s of speech "
-                f"(±5% timing handled later; match length in {target_lang})."
+                f"(±10% timing handled later; match length in {target_lang})."
             )
         return f"""
 You are a voice-over dubbing studio translator.
@@ -39,6 +40,22 @@ Original:
 {text}
 
 Your answer must be only the translated text of the single line.
+""".strip()
+
+    if type == 3:
+        source_lang = value["source_lang"]
+        target_lang = value["target_lang"]
+        lines = value["lines"]
+        payload = json.dumps(lines, ensure_ascii=False, separators=(",", ":"))
+        return f"""
+You are a voice-over dubbing studio translator.
+Translate each line from "{source_lang}" to "{target_lang}".
+For each item keep similar length (chars/words as in the original). Natural conversational dubbing.
+Return ONLY a JSON array, same order and count as input:
+[{{"id": "<same id>", "text": "<translation>"}}, ...]
+No markdown, no explanations.
+Input lines:
+{payload}
 """.strip()
 
     if type == 1:

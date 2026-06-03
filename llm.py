@@ -18,6 +18,11 @@ _SYSTEM_JSON = (
 
 _SYSTEM_TEXT = "You are a professional dubbing translator. Reply with only the translated line."
 
+_SYSTEM_BATCH_TRANSLATE = (
+    "You are a professional dubbing translator. "
+    "Return ONLY a valid JSON array of objects with keys id and text. No markdown."
+)
+
 
 def _client_instance() -> OpenAI:
     global _client
@@ -29,9 +34,19 @@ def _client_instance() -> OpenAI:
     return _client
 
 
-def llm_response(user_prompt: str, *, json_only: bool = False) -> str:
-    """json_only=True — для разметки диалога (массив JSON)."""
-    system = _SYSTEM_JSON if json_only else _SYSTEM_TEXT
+def llm_response(
+    user_prompt: str,
+    *,
+    json_only: bool = False,
+    batch_translate: bool = False,
+) -> str:
+    """json_only — разметка; batch_translate — пакетный перевод (JSON-массив)."""
+    if batch_translate:
+        system = _SYSTEM_BATCH_TRANSLATE
+    elif json_only:
+        system = _SYSTEM_JSON
+    else:
+        system = _SYSTEM_TEXT
     response = _client_instance().chat.completions.create(
         model=get_openai_model(),
         messages=[
@@ -47,6 +62,7 @@ def llm_response_retry(
     user_prompt: str,
     *,
     json_only: bool = False,
+    batch_translate: bool = False,
     retries: int = 3,
     retry_suffix: str = "",
 ) -> str:
@@ -55,7 +71,11 @@ def llm_response_retry(
         prompt = user_prompt
         if attempt and retry_suffix:
             prompt = f"{user_prompt}\n\n{retry_suffix}"
-        last = llm_response(prompt, json_only=json_only)
+        last = llm_response(
+            prompt,
+            json_only=json_only,
+            batch_translate=batch_translate,
+        )
         if last and not looks_like_refusal(last, json_only=json_only):
             return last
         if attempt + 1 < retries:
