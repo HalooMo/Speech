@@ -1,7 +1,7 @@
 """
 SpeechLab — закадровый дубляж по PRD.md.
 
-Точка входа: run(project_name, video_path, source_language, target_language)
+Точка входа: run(project_name, video_path, source_language, target_language, …voice_*)
 → Path к {project}_dubbed.mp4 и dub_output_path.txt
 """
 from __future__ import annotations
@@ -13,13 +13,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import llm
 import numpy as np
 import prompt
 import soundfile as sf
 
-from env_config import get_hf_token
+from config.env_config import get_hf_token
 from test import init_asr_models, run_segment_pipeline, unload_asr_models
+from tools import llm
 
 ROOT = Path(__file__).resolve().parent
 SR = 16000
@@ -86,20 +86,9 @@ def _audio_duration(path: Path) -> float:
     return info.frames / info.samplerate
 
 
-def _pad_or_trim(wav_path: Path, target_sec: float) -> None:
-    data, sr = sf.read(wav_path, dtype="float32")
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    target_len = int(round(target_sec * sr))
-    cur_len = len(data)
-    if cur_len < target_len:
-        data = np.pad(data, (0, target_len - cur_len))
-    elif cur_len > target_len:
-        data = data[:target_len]
-    sf.write(wav_path, data, sr)
-
-
+# --- ffmpeg: извлечение и demucs ---
 def extract_audio_16k(video_path: Path, out_wav: Path) -> None:
+    """Аудио из видео/файла → mono 16 kHz (вход demucs)."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     _run([
         "ffmpeg", "-y", "-i", str(video_path),
@@ -125,11 +114,20 @@ def separate_stems(audio_wav: Path, stems_dir: Path) -> tuple[Path, Path]:
 MIN_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MIN_PRIMARY_SEC", "40"))
 MAX_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MAX_PRIMARY_SEC", "90"))
 ORIGINAL_AUDIO_RATIO = float(os.environ.get("SPEECHLAB_ORIGINAL_AUDIO_RATIO", "0.3"))
+DUB_VOLUME_PERCENT = float(os.environ.get("SPEECHLAB_DUB_VOLUME_PERCENT", "100"))
+TRANSLATE_BATCH_SIZE = int(os.environ.get("SPEECHLAB_TRANSLATE_BATCH_SIZE", "12"))
 
 
-def _split_long_segment(
-    start: float, end: float, max_len: float,
-) -> list[tuple[float, float]]:
+# --- первичная нарезка по паузам (40–90 с) ---
+def _dub_gain(percent=None):
+    """Множитель громкости дубляжа из %."""
+    p = DUB_VOLUME_PERCENT if percent is None else percent
+    if p <= 0:
+        raise ValueError("Громкость дубляжа (%) должна быть > 0")
+    return p / 100.0
+
+
+def _split_long_segment(start, end, max_len):
     segs: list[tuple[float, float]] = []
     s = start
     while end - s > max_len:
@@ -253,7 +251,8 @@ def split_primary_segments(
     return manifest
 
 
-def _parse_speech_txt(path: Path) -> dict | None:
+# --- парсинг speech_*.txt / перевод / casting / TTS ---
+def _parse_speech_txt(path):
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) < 3:
         return None
@@ -281,7 +280,8 @@ def _list_speech_wav(audio_dir: Path) -> list[Path]:
 
 def build_casting(second_seg_dir: Path) -> dict:
     """Признаки голоса по репликам → casting.json (dict, PRD)."""
-    from get_param import profile_from_wav, unload_model
+    from tools import dubbing
+    from tools.get_param import profile_from_wav, unload_model
 
     audio_dir = second_seg_dir / "output_audio_segments"
     text_dir = second_seg_dir / "output_text_segments"
@@ -296,13 +296,14 @@ def build_casting(second_seg_dir: Path) -> dict:
         if not wavs:
             continue
         wav = wavs[0]
+        profile = dubbing.apply_voice_override(profile_from_wav(wav))
         casting["segments"][txt.name] = {
             "file": txt.name,
             "speaker": meta["speaker"],
             "wav": wav.name,
             "start": meta["start"],
             "end": meta["end"],
-            "profile": profile_from_wav(wav),
+            "profile": profile,
         }
 
     out_path = second_seg_dir / "casting.json"
@@ -314,10 +315,7 @@ def build_casting(second_seg_dir: Path) -> dict:
     return casting
 
 
-TRANSLATE_BATCH_SIZE = int(os.environ.get("SPEECHLAB_TRANSLATE_BATCH_SIZE", "12"))
-
-
-def _parse_batch_translations(raw: str) -> list[dict]:
+def _parse_batch_translations(raw):
     s = (raw or "").strip()
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
@@ -397,7 +395,6 @@ def translate_segments(
                 json_only=False,
                 batch_translate=True,
                 retries=2,
-                retry_suffix='Return ONLY JSON array [{"id":"...","text":"..."}]',
             )
             for item in _parse_batch_translations(raw):
                 rid = str(item.get("id", "")).strip()
@@ -434,7 +431,8 @@ def dub_segments(
     second_seg_dir: Path,
     target_lang: str,
 ) -> Path:
-    from dubbing import dub_from_profile, ensure_voice_bank, unload_model
+    from tools import dubbing
+    from tools.dubbing import dub_from_profile, ensure_voice_bank, unload_model
 
     tts_lang = _tts_language(target_lang)
     print("  TTS: банк 8 голосов (Design → Base clone)…")
@@ -451,7 +449,7 @@ def dub_segments(
         if not meta:
             continue
         seg = seg_map.get(txt.name, {})
-        profile = seg.get("profile", {})
+        profile = dubbing.apply_voice_override(seg.get("profile", {}))
 
         src_wav = second_seg_dir / "output_audio_segments"
         wav_match = list(src_wav.glob(f"speech_{int(SPEECH_TXT.match(txt.name).group(1)):03d}_*.wav"))
@@ -471,10 +469,8 @@ def dub_segments(
     return final_dir
 
 
-def _build_timeline(
-    placements: list[tuple[float, Path]],
-    min_total_dur: float,
-) -> np.ndarray:
+# --- склейка реплик и финальный микс ---
+def _build_timeline(placements, min_total_dur):
     """Суммирование реплик на таймлайне (overlay без обрезки WAV)."""
     max_end = float(min_total_dur)
     for play_start, path in placements:
@@ -506,7 +502,7 @@ def _build_timeline(
 
 def restore_primary_segment(primary_dir: Path) -> Path:
     """Склейка final_audio: fit ±10%, overlay только у разных спикеров (PRD)."""
-    from fit_audio import schedule_placements
+    from tools.fit_audio import schedule_placements
 
     second_root = primary_dir / "second_seg"
     seg_wav = primary_dir / "segment.wav"
@@ -621,12 +617,7 @@ def _resample_mono(data: np.ndarray, sr: int, target_sr: int = SR) -> np.ndarray
 
 def extract_original_audio_16k(video_path: Path, out_wav: Path) -> None:
     """Оригинальная звуковая дорожка видео → mono 16 kHz."""
-    out_wav.parent.mkdir(parents=True, exist_ok=True)
-    _run([
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-vn", "-acodec", "pcm_s16le", "-ar", str(SR), "-ac", "1",
-        str(out_wav),
-    ])
+    extract_audio_16k(video_path, out_wav)
 
 
 def mix_dub_with_original(
@@ -635,9 +626,11 @@ def mix_dub_with_original(
     out_wav: Path,
     *,
     original_ratio: float | None = None,
+    dub_volume_percent: float | None = None,
 ) -> Path:
-    """PRD: финальная дорожка = дубляж + ~30% оригинала из видео."""
+    """Финальная дорожка = дубляж × (dub%) + оригинал видео × original_ratio."""
     ratio = ORIGINAL_AUDIO_RATIO if original_ratio is None else original_ratio
+    dub_gain = _dub_gain(dub_volume_percent)
     if not _has_video_stream(video_path):
         import shutil
         shutil.copy2(dub_wav, out_wav)
@@ -660,14 +653,17 @@ def mix_dub_with_original(
         orig = orig[:n]
         dub = dub[:n]
 
-    mixed = dub + orig * ratio
+    mixed = dub * dub_gain + orig * ratio
     peak = float(np.max(np.abs(mixed))) or 1.0
     if peak > 1.0:
         mixed = mixed / peak * 0.98
 
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     sf.write(out_wav, mixed.astype(np.float32), SR)
-    print(f"  микс: дубляж + оригинал × {ratio:.2f}")
+    dub_pct = dub_gain * 100.0
+    print(
+        f"  микс: дубляж × {dub_pct:.0f}% (отн. оригинала) + оригинал × {ratio:.2f}"
+    )
     return out_wav
 
 
@@ -708,14 +704,24 @@ def run(
     target_language: str,
     *,
     hf_token: str | None = None,
+    dub_volume_percent: float | None = None,
+    original_audio_ratio: float | None = None,
+    voice_design_template: str | None = None,
+    voice_design_by_key: dict | None = None,
+    voice_gender: str | None = None,
+    voice_age: int | float | None = None,
+    voice_design_temperature: float | None = None,
 ) -> Path:
     """
     Полный пайплайн SpeechLab.
 
-    project_name — имя папки проекта (создаётся в корне репозитория).
-    video_path — исходное видео (.mp4 и др.).
-    source_language — язык оригинала (код Whisper, напр. en).
-    target_language — язык дубляжа (код или Russian/English для TTS).
+    voice_design_template — шаблон VoiceDesign
+      (плейсхолдеры: {lang}, {gender_hint}, {age_hint}). None → DESIGN_TEMPLATE.
+    voice_design_by_key — переопределение по ключу, напр. {"male_mature": "..."}.
+    voice_gender — пол для всех реплик: male / female. None → детекция по WAV.
+    voice_age — возраст в годах (число), напр. 35. None → детекция по WAV.
+    voice_design_temperature — температура VoiceDesign (0–1). None → DESIGN_TEMP.
+    Без кастомных промптов/температуры — банк .speechlab_voice_bank по умолчанию.
     """
     video_path = Path(video_path).resolve()
     if not video_path.is_file():
@@ -724,8 +730,55 @@ def run(
     project_dir = ROOT / project_name
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    from tools import dubbing
+
+    use_project_bank = bool(
+        (voice_design_template or "").strip()
+        or voice_design_by_key
+        or voice_design_temperature is not None
+    )
+    dubbing.set_voice_prompts(
+        template=voice_design_template,
+        by_key=voice_design_by_key,
+        cache_dir=project_dir / "voice_bank" if use_project_bank else None,
+        gender=voice_gender,
+        age=voice_age,
+        design_temperature=voice_design_temperature,
+    )
+    if use_project_bank:
+        print(f"  TTS: банк голоса проекта → {project_dir / 'voice_bank'}")
+    if dubbing.has_voice_profile_override():
+        parts = []
+        if voice_gender:
+            parts.append(f"пол={voice_gender}")
+        if voice_age is not None:
+            parts.append(f"возраст={voice_age}")
+        print(f"  TTS: профиль голоса для всех реплик: {', '.join(parts)}")
+
     token = hf_token or get_hf_token()
 
+    try:
+        return _run_pipeline(
+            project_name, video_path, project_dir, source_language, target_language,
+            token=token,
+            dub_volume_percent=dub_volume_percent,
+            original_audio_ratio=original_audio_ratio,
+        )
+    finally:
+        dubbing.clear_voice_prompts()
+
+
+def _run_pipeline(
+    project_name,
+    video_path,
+    project_dir,
+    source_language,
+    target_language,
+    *,
+    token,
+    dub_volume_percent=None,
+    original_audio_ratio=None,
+):
     print("=== 1. Аудио 16 kHz + demucs ===")
     audio_16k = project_dir / "audio_16k.wav"
     extract_audio_16k(video_path, audio_16k)
@@ -779,7 +832,13 @@ def run(
 
     print("=== 9. Оригинал видео ~30% + mux MP4 ===")
     mux_audio = project_dir / "final_mux_audio.wav"
-    mix_dub_with_original(video_path, full_audio, mux_audio)
+    mix_dub_with_original(
+        video_path,
+        full_audio,
+        mux_audio,
+        original_ratio=original_audio_ratio,
+        dub_volume_percent=dub_volume_percent,
+    )
     out_video = project_dir / f"{project_name}_dubbed.mp4"
     mux_video(video_path, mux_audio, out_video)
 

@@ -2,9 +2,14 @@
 .env.local
 *.env
 !.env.example
+!config/.env.example
 
 __pycache__/
 *.py[cod]
 *$py.class
 
 .speechlab_voice_bank/
+
+# Kaggle: ячейка с секретами + локальный пакет для датасета
+my_files/
+kaggle/kaggle_one_cell.py

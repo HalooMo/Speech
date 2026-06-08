@@ -72,19 +72,19 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Скопируйте шаблон секретов и заполните **локально** (файл `.env` в git не попадает):
+Скопируйте шаблон секретов и заполните **локально** (файл `config/.env` в git не попадает):
 
 ```bash
-copy .env.example .env          # Windows
-# cp .env.example .env          # Linux / macOS
+copy config\.env.example config\.env          # Windows
+# cp config/.env.example config/.env          # Linux / macOS
 ```
 
 | Переменная | Назначение |
 |------------|------------|
 | `HF_TOKEN` | Hugging Face (pyannote, модели) |
 | `OPENAI_API_KEY` | LLM: сегментация + перевод |
-| `OPENAI_BASE_URL` | Базовый URL API (по умолчанию в `env_config.py`) |
-| `OPENAI_MODEL` | Модель чата |
+| `OPENAI_BASE_URL` | URL OpenAI-compatible API (по умолчанию agentplatform) |
+| `OPENAI_MODEL` | Модель LLM (по умолчанию `openai/gpt-5.5`) |
 
 ### Запуск
 
@@ -127,23 +127,27 @@ Speech/
 ├── main.py              # оркестратор E2E
 ├── test.py              # diarization → WhisperX → LLM → нарезка
 ├── prompt.py            # промпты LLM
-├── llm.py               # клиент API
-├── get_param.py         # пол, возраст, эмоция по WAV
-├── dubbing.py           # Qwen3-TTS
-├── fit_audio.py         # подгонка длины и таймлайн
-├── env_config.py        # загрузка .env
-├── kaggle_one_cell.py   # один ноутбук на Kaggle
-├── kaggle/              # инструкция для Kaggle
+├── config/
+│   ├── env_config.py    # загрузка .env (config/.env)
+│   └── .env.example
+├── tools/
+│   ├── llm.py           # клиент LLM API
+│   ├── get_param.py     # пол, возраст, эмоция по WAV
+│   ├── dubbing.py       # Qwen3-TTS
+│   └── fit_audio.py     # подгонка длины и таймлайн
+├── kaggle/
+│   ├── kaggle_one_cell.py
+│   └── README.md
 ├── PRD.md               # требования (источник истины)
 └── .cursor/rules/
-    └── main-rules.mdc   # правила для агента в Cursor
+    └── main-rules.mdc
 ```
 
 ---
 
 ## Kaggle
 
-Полный прогон в одной ячейке: скопируйте [`kaggle_one_cell.py`](kaggle_one_cell.py) в GPU-ноутбук.
+Полный прогон в одной ячейке: скопируйте [`kaggle/kaggle_one_cell.py`](kaggle/kaggle_one_cell.py) в GPU-ноутбук.
 
 Подробности: [`kaggle/README.md`](kaggle/README.md)
 
@@ -161,12 +165,14 @@ Speech/
 |------------|--------------|----------|
 | `SPEECHLAB_MIN_PRIMARY_SEC` | `40` | Мин. длина первичного сегмента (сек) |
 | `SPEECHLAB_MAX_PRIMARY_SEC` | `90` | Макс. длина первичного сегмента (сек) |
-| `SPEECHLAB_ORIGINAL_AUDIO_RATIO` | `0.3` | Доля оригинала видео в финальном миксе |
+| `SPEECHLAB_ORIGINAL_AUDIO_RATIO` | `0.3` | Громкость оригинала видео в миксе (коэфф.) |
+| `SPEECHLAB_DUB_VOLUME_PERCENT` | `100` | Громкость дубляжа относительно оригинала, % |
 | `SPEECHLAB_WHISPER_MODEL` | `large-v3` | Модель WhisperX |
+| `SPEECHLAB_COMPUTE_TYPE` | `float16` | Тип вычислений WhisperX на GPU |
 | `SPEECHLAB_COMPUTE_TYPE` | `float32` | `float16` на GPU для экономии VRAM |
 | `SPEECHLAB_MAX_WORDS_LLM` | `2800` | Лимит слов в одном запросе к LLM |
 
-На Windows при ошибках VAD/k2 в WhisperX используйте `vad_method="silero"`.
+На Windows при ошибках VAD/k2 в WhisperX используйте `vad_method="silero"` (уже в test.py).
 
 ---
 
@@ -181,7 +187,7 @@ Speech/
 
 ## Соответствие PRD
 
-Поведение кода следует [`PRD.md`](PRD.md): первичка 40–90 с, `casting.json`, Qwen3-TTS, финальный микс `дубляж + оригинал×0.3`, путь к ролику в `dub_output_path.txt`. Склейка реплик — суммирование на таймлайне; наложение включается, если после fit ±5% реплика не влезает в слот **и** спикер сменился.
+Поведение кода следует [`PRD.md`](PRD.md): первичка 40–90 с, `casting.json`, Qwen3-TTS, финальный микс `дубляж×DUB% + оригинал×0.3`, путь к ролику в `dub_output_path.txt`. Склейка реплик — суммирование на таймлайне; наложение включается, если после fit ±5% реплика не влезает в слот **и** спикер сменился.
 
 ---
 
