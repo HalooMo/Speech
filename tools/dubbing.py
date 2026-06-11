@@ -18,12 +18,12 @@ MAP_LANG = {
     "de": "German", "german": "German", "es": "Spanish", "spanish": "Spanish",
     "fr": "French", "french": "French", "auto": "Auto",
 }
-GENDER_HINT = {"male": "masculine male voice, warm timbre", "female": "feminine female voice, warm timbre"}
+GENDER_HINT = {"male": "masculine male voice", "female": "feminine female voice, warm timbre"}
 AGE_HINT = {
-    "child": "child 8-12, bright and spontaneous",
-    "teenager": "teen 15-18, energetic, slightly uneven",
-    "mature": "adult 28-45, relaxed and natural",
-    "elderly": "senior 65-75, warm, unhurried",
+    "child": "child",
+    "teenager": "teen",
+    "mature": "adult",
+    "elderly": "adult",
 }
 
 # промпты VoiceDesign (редактируйте здесь)
@@ -34,7 +34,7 @@ REF_TEXT = {
     "Spanish": "Te lo digo como en la vida real, sin tono de locutor, natural y cercano.",
     "French": "Je le dis comme dans la vraie vie, pas comme à la radio — naturel et vivant.",
 }
-DESIGN_TEMPLATE = "Film dubbing voice, native {lang}. {gender_hint}. {age_hint}. Sounds alive and human"
+DESIGN_TEMPLATE = "Natural {gender_hint}, {lang}. {age_hint}."
 REF_TEXT_BY_KEY = {}
 DESIGN_BY_KEY = {}
 DESIGN_TEMP = 0.72
@@ -322,14 +322,15 @@ def dub_tts(text, language, gender, age, out_path):
     )
 
 
-def dub_from_profile(text, language, profile, out_path):
-    """Озвучка по dict из casting.json."""
+def dub_from_profile(text, language, profile, out_path, *, bank_ready=False):
+    """Озвучка по dict из casting.json. bank_ready=True если ensure_voice_bank уже вызван."""
     if not (text or "").strip():
         raise ValueError("text пустой")
     profile = apply_voice_override(profile or {})
     lang = map_lang(language)
     vk = normalize_voice_key(profile)
-    ensure_voice_bank(lang)
+    if not bank_ready:
+        ensure_voice_bank(lang)
     key = f"{lang}/{vk}"
     prompt = _clone_prompts.get(key)
     if prompt is None:

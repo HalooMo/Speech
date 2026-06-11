@@ -6,6 +6,7 @@ SpeechLab — закадровый дубляж по PRD.md.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -116,6 +117,59 @@ MAX_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MAX_PRIMARY_SEC", "90"))
 ORIGINAL_AUDIO_RATIO = float(os.environ.get("SPEECHLAB_ORIGINAL_AUDIO_RATIO", "0.3"))
 DUB_VOLUME_PERCENT = float(os.environ.get("SPEECHLAB_DUB_VOLUME_PERCENT", "100"))
 TRANSLATE_BATCH_SIZE = int(os.environ.get("SPEECHLAB_TRANSLATE_BATCH_SIZE", "12"))
+RESUME = os.environ.get("SPEECHLAB_RESUME", "1").lower() not in ("0", "false", "no")
+CAST_PER_SPEAKER = os.environ.get("SPEECHLAB_CAST_PER_SPEAKER", "1").lower() not in ("0", "false", "no")
+SKIP_DEMUCS = os.environ.get("SPEECHLAB_SKIP_DEMUCS", "0").lower() in ("1", "true", "yes")
+STATE_FILE = "pipeline_state.json"
+
+
+def _projects_root(projects_root: Path | str | None = None) -> Path:
+    if projects_root:
+        return Path(projects_root).resolve()
+    env_root = os.environ.get("SPEECHLAB_PROJECTS_ROOT", "").strip()
+    return Path(env_root).resolve() if env_root else ROOT
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_pipeline_state(project_dir: Path) -> dict | None:
+    p = project_dir / STATE_FILE
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _save_pipeline_state(project_dir: Path, video_path: Path, **extra) -> None:
+    data = {
+        "input_sha256": _file_sha256(video_path),
+        "video_path": str(video_path.resolve()),
+        **extra,
+    }
+    (project_dir / STATE_FILE).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def _resume_enabled(project_dir: Path, video_path: Path) -> bool:
+    """Resume только если входной файл не менялся."""
+    if not RESUME:
+        return False
+    prev = _load_pipeline_state(project_dir)
+    if not prev:
+        return False
+    if prev.get("input_sha256") != _file_sha256(video_path):
+        print("  resume: входной файл изменился — шаги пересчитываются")
+        return False
+    return True
 
 
 # --- первичная нарезка по паузам (40–90 с) ---
@@ -278,14 +332,60 @@ def _list_speech_wav(audio_dir: Path) -> list[Path]:
     return sorted(files, key=lambda p: int(SPEECH_WAV.match(p.name).group(1)))
 
 
-def build_casting(second_seg_dir: Path) -> dict:
-    """Признаки голоса по репликам → casting.json (dict, PRD)."""
+def _has_asr_outputs(second_seg_dir: Path) -> bool:
+    text_dir = second_seg_dir / "output_text_segments"
+    audio_dir = second_seg_dir / "output_audio_segments"
+    if not text_dir.is_dir() or not audio_dir.is_dir():
+        return False
+    txts = _list_speech_txt(text_dir)
+    if not txts:
+        return False
+    for txt in txts:
+        idx = SPEECH_TXT.match(txt.name).group(1)
+        if not list(audio_dir.glob(f"speech_{int(idx):03d}_*.wav")):
+            return False
+    return True
+
+
+def _has_translate_outputs(second_seg_dir: Path) -> bool:
+    target_dir = second_seg_dir / "target_text"
+    text_dir = second_seg_dir / "output_text_segments"
+    if not target_dir.is_dir() or not text_dir.is_dir():
+        return False
+    src = [t for t in _list_speech_txt(text_dir) if _parse_speech_txt(t)]
+    if not src:
+        return False
+    return all((target_dir / t.name).is_file() for t in src)
+
+
+def _has_casting(second_seg_dir: Path) -> bool:
+    return (second_seg_dir / "casting.json").is_file()
+
+
+def _has_dub_outputs(second_seg_dir: Path) -> bool:
+    target_dir = second_seg_dir / "target_text"
+    final_dir = second_seg_dir / "final_audio"
+    if not target_dir.is_dir() or not final_dir.is_dir():
+        return False
+    txts = [t for t in _list_speech_txt(target_dir) if _parse_speech_txt(t)]
+    if not txts:
+        return False
+    for txt in txts:
+        idx = int(SPEECH_TXT.match(txt.name).group(1))
+        if not list(final_dir.glob(f"speech_{idx:03d}_*_dub.wav")):
+            return False
+    return True
+
+
+def build_casting(second_seg_dir: Path, *, unload: bool = True) -> dict:
+    """Признаки голоса → casting.json. По умолчанию один профиль на спикера (длиннейшая реплика)."""
     from tools import dubbing
     from tools.get_param import profile_from_wav, unload_model
 
     audio_dir = second_seg_dir / "output_audio_segments"
     text_dir = second_seg_dir / "output_text_segments"
     casting: dict = {"segments": {}}
+    entries: list[dict] = []
 
     for txt in _list_speech_txt(text_dir):
         meta = _parse_speech_txt(txt)
@@ -295,23 +395,51 @@ def build_casting(second_seg_dir: Path) -> dict:
         wavs = list(audio_dir.glob(f"speech_{int(idx):03d}_*.wav"))
         if not wavs:
             continue
-        wav = wavs[0]
-        profile = dubbing.apply_voice_override(profile_from_wav(wav))
-        casting["segments"][txt.name] = {
-            "file": txt.name,
+        entries.append({
+            "txt": txt,
+            "meta": meta,
+            "wav": wavs[0],
             "speaker": meta["speaker"],
-            "wav": wav.name,
-            "start": meta["start"],
-            "end": meta["end"],
-            "profile": profile,
-        }
+            "dur": float(meta["end"]) - float(meta["start"]),
+        })
+
+    if CAST_PER_SPEAKER and entries:
+        by_spk: dict[str, list[dict]] = {}
+        for e in entries:
+            by_spk.setdefault(e["speaker"], []).append(e)
+        profiles: dict[str, dict] = {}
+        for spk, items in by_spk.items():
+            ref = max(items, key=lambda x: x["dur"])
+            profiles[spk] = dubbing.apply_voice_override(profile_from_wav(ref["wav"]))
+        for e in entries:
+            profile = profiles[e["speaker"]]
+            casting["segments"][e["txt"].name] = {
+                "file": e["txt"].name,
+                "speaker": e["speaker"],
+                "wav": e["wav"].name,
+                "start": e["meta"]["start"],
+                "end": e["meta"]["end"],
+                "profile": profile,
+            }
+    else:
+        for e in entries:
+            profile = dubbing.apply_voice_override(profile_from_wav(e["wav"]))
+            casting["segments"][e["txt"].name] = {
+                "file": e["txt"].name,
+                "speaker": e["speaker"],
+                "wav": e["wav"].name,
+                "start": e["meta"]["start"],
+                "end": e["meta"]["end"],
+                "profile": profile,
+            }
 
     out_path = second_seg_dir / "casting.json"
     out_path.write_text(
         json.dumps(casting, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    unload_model()
+    if unload:
+        unload_model()
     return casting
 
 
@@ -430,13 +558,18 @@ def _load_casting(second_seg_dir: Path) -> dict:
 def dub_segments(
     second_seg_dir: Path,
     target_lang: str,
+    *,
+    unload: bool = True,
+    bank_ready: bool = False,
 ) -> Path:
     from tools import dubbing
     from tools.dubbing import dub_from_profile, ensure_voice_bank, unload_model
 
     tts_lang = _tts_language(target_lang)
-    print("  TTS: банк 8 голосов (Design → Base clone)…")
-    ensure_voice_bank(tts_lang)
+    if not bank_ready:
+        print("  TTS: банк 8 голосов (Design → Base clone)…")
+        ensure_voice_bank(tts_lang)
+        bank_ready = True
 
     casting = _load_casting(second_seg_dir)
     seg_map = casting.get("segments", {})
@@ -461,11 +594,13 @@ def dub_segments(
             language=tts_lang,
             profile=profile,
             out_path=out_wav,
+            bank_ready=bank_ready,
         )
         slot = float(meta["end"]) - float(meta["start"])
         print(f"  озвучка {out_wav.name} (слот {slot:.2f}s, fit при сборке)")
 
-    unload_model()
+    if unload:
+        unload_model()
     return final_dir
 
 
@@ -711,6 +846,7 @@ def run(
     voice_gender: str | None = None,
     voice_age: int | float | None = None,
     voice_design_temperature: float | None = None,
+    projects_root: str | Path | None = None,
 ) -> Path:
     """
     Полный пайплайн SpeechLab.
@@ -727,7 +863,8 @@ def run(
     if not video_path.is_file():
         raise FileNotFoundError(video_path)
 
-    project_dir = ROOT / project_name
+    base = _projects_root(projects_root)
+    project_dir = base / project_name
     project_dir.mkdir(parents=True, exist_ok=True)
 
     from tools import dubbing
@@ -780,21 +917,36 @@ def _run_pipeline(
     original_audio_ratio=None,
 ):
     print("=== 1. Аудио 16 kHz + demucs ===")
-    audio_16k = project_dir / "audio_16k.wav"
-    extract_audio_16k(video_path, audio_16k)
-    stems_dir = project_dir / "demucs_stems"
-    vocals_wav, music_stem = separate_stems(audio_16k, stems_dir)
     project_vocals = project_dir / "vocals.wav"
-    if project_vocals.exists():
-        project_vocals.unlink()
-    project_vocals.write_bytes(vocals_wav.read_bytes())
-    print(f"vocals: {project_vocals}, music: {music_stem}")
+    stems_dir = project_dir / "demucs_stems"
+    music_candidates = list(stems_dir.rglob("no_vocals.wav")) if stems_dir.is_dir() else []
+
+    if SKIP_DEMUCS and project_vocals.is_file() and music_candidates:
+        music_stem = music_candidates[0]
+        print(f"  demucs: пропуск (SPEECHLAB_SKIP_DEMUCS), vocals: {project_vocals}")
+    else:
+        audio_16k = project_dir / "audio_16k.wav"
+        extract_audio_16k(video_path, audio_16k)
+        vocals_wav, music_stem = separate_stems(audio_16k, stems_dir)
+        if project_vocals.exists():
+            project_vocals.unlink()
+        project_vocals.write_bytes(vocals_wav.read_bytes())
+        print(f"vocals: {project_vocals}, music: {music_stem}")
 
     print("=== 2. Первичная нарезка по тишине ===")
     first_seg_dir = project_dir / "first_seg"
     manifest = split_primary_segments(project_vocals, first_seg_dir)
 
-    print("=== 3. Вторичные сегменты (PRD: pyannote + WhisperX + LLM) ===")
+    resume_ok = _resume_enabled(project_dir, video_path)
+    _save_pipeline_state(
+        project_dir, video_path,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+    print("=== 3. ASR (pyannote + WhisperX + LLM) ===")
+    jobs: list[tuple[Path, Path]] = []
+    replica_count = 0
     init_asr_models(source_language, token)
     try:
         for item in manifest:
@@ -802,30 +954,64 @@ def _run_pipeline(
             seg_wav = primary_dir / "segment.wav"
             second_seg = primary_dir / "second_seg"
             second_seg.mkdir(parents=True, exist_ok=True)
+            jobs.append((primary_dir, second_seg))
 
             print(f"--- Первичный {item['folder']} ---")
-            run_segment_pipeline(
-                seg_wav,
-                second_seg / "output_audio_segments",
-                second_seg / "output_text_segments",
-                source_language,
-                hf_token=token,
-                reuse_asr=True,
-            )
-
-            print("=== 4. Перевод (LLM batch, длина ≈ слот) ===")
-            translate_segments(second_seg, source_language, target_language)
-
-            print("=== 5. casting.json (dict: пол, возраст) ===")
-            build_casting(second_seg)
-
-            print("=== 6. Qwen3-TTS → final_audio ===")
-            dub_segments(second_seg, target_language)
-
-            print("=== 7. Склейка реплик (fit ±10%, overlay разных спикеров) ===")
-            restore_primary_segment(primary_dir)
+            if resume_ok and _has_asr_outputs(second_seg):
+                print("  ASR: пропуск (resume)")
+                replica_count += len(_list_speech_txt(second_seg / "output_text_segments"))
+            else:
+                segs = run_segment_pipeline(
+                    seg_wav,
+                    second_seg / "output_audio_segments",
+                    second_seg / "output_text_segments",
+                    source_language,
+                    hf_token=token,
+                    reuse_asr=True,
+                )
+                replica_count += len(segs)
     finally:
         unload_asr_models()
+
+    if replica_count == 0:
+        raise ValueError(
+            "ASR/LLM не нашли реплик для озвучки. Проверьте язык source_language и качество vocals."
+        )
+    print(f"  реплик для дубляжа: {replica_count}")
+
+    print("=== 4. Перевод (LLM batch) ===")
+    for primary_dir, second_seg in jobs:
+        if resume_ok and _has_translate_outputs(second_seg):
+            print(f"  перевод {primary_dir.name}: пропуск (resume)")
+            continue
+        translate_segments(second_seg, source_language, target_language)
+
+    print("=== 5. casting.json ===")
+    from tools.get_param import unload_model as unload_casting
+
+    for primary_dir, second_seg in jobs:
+        if resume_ok and _has_casting(second_seg):
+            print(f"  casting {primary_dir.name}: пропуск (resume)")
+            continue
+        build_casting(second_seg, unload=False)
+    unload_casting()
+
+    print("=== 6. Qwen3-TTS → final_audio ===")
+    from tools.dubbing import ensure_voice_bank, unload_model as unload_tts
+
+    tts_lang = _tts_language(target_language)
+    print("  TTS: банк 8 голосов (Design → Base clone)…")
+    ensure_voice_bank(tts_lang)
+    for primary_dir, second_seg in jobs:
+        if resume_ok and _has_dub_outputs(second_seg):
+            print(f"  TTS {primary_dir.name}: пропуск (resume)")
+            continue
+        dub_segments(second_seg, target_language, unload=False, bank_ready=True)
+    unload_tts()
+
+    print("=== 7. Склейка реплик ===")
+    for primary_dir, _ in jobs:
+        restore_primary_segment(primary_dir)
 
     print("=== 8. Первичные сегменты + музыка → full_dub.wav ===")
     full_audio = restore_full_vocals(project_dir, manifest, music_stem)

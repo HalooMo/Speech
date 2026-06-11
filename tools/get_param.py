@@ -11,6 +11,7 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Ve
 
 EMOTION_MODEL = os.environ.get("SPEECHLAB_EMOTION_MODEL", "Dpngtm/wav2vec2-emotion-recognition")
 AGE_MODEL = os.environ.get("SPEECHLAB_AGE_GENDER_MODEL", "audeering/wav2vec2-large-robust-24-ft-age-gender")
+SKIP_EMOTION = os.environ.get("SPEECHLAB_SKIP_EMOTION", "1").lower() not in ("0", "false", "no")
 
 _emotion = {"fe": None, "model": None}
 _age = {"proc": None, "model": None, "dev": None}
@@ -113,13 +114,20 @@ def _predict_emotion(audio):
     return label, round(probs[i].item(), 4)
 
 
-def profile_from_wav(audio_path):
-    """Профиль реплики для casting.json."""
+def profile_from_wav(audio_path, *, with_emotion=None):
+    """Профиль реплики для casting.json. Эмоция не используется в TTS — по умолчанию выкл."""
+    use_emo = (not SKIP_EMOTION) if with_emotion is None else with_emotion
     audio = load_audio_16k(audio_path)
     ag = _predict_age_gender(audio)
-    emo, conf = _predict_emotion(audio)
-    emo_map = {"neutral": "calm", "calm": "calm", "sad": "sad", "happy": "happy", "angry": "angry", "disgust": "disgust"}
-    primary = emo_map.get(emo, "calm")
+    if use_emo:
+        emo, conf = _predict_emotion(audio)
+        emo_map = {
+            "neutral": "calm", "calm": "calm", "sad": "sad", "happy": "happy",
+            "angry": "angry", "disgust": "disgust",
+        }
+        primary = emo_map.get(emo, "calm")
+    else:
+        emo, conf, primary = "skipped", 0.0, "calm"
     return {
         "gender": ag["gender"], "age_group": ag["age_group"], "age": ag["age"],
         "confidence_gender": ag["confidence"], "gender_probs": ag["probs"],

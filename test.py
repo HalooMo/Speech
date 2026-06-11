@@ -125,8 +125,13 @@ def run_segment_pipeline(audio_path, output_audio_dir, output_text_dir, source_l
         unload_asr_models()
         init_asr_models(source_language, token)
 
-    audio = whisperx.load_audio(str(audio_path))
     wave, sr = torchaudio.load(str(audio_path))
+    if wave.shape[0] > 1:
+        wave = wave.mean(dim=0, keepdim=True)
+    if sr != 16000:
+        wave = torchaudio.functional.resample(wave, sr, 16000)
+        sr = 16000
+    audio = wave.squeeze(0).numpy()
     diar = _asr["diarization"]({"waveform": wave, "sample_rate": sr})
 
     rows = []

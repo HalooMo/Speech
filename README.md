@@ -120,6 +120,53 @@ python test.py
 
 ---
 
+## Production API
+
+HTTP-очередь дубляжа (одна задача GPU одновременно):
+
+```bash
+pip install -r requirements-server.txt
+# config/.env: SPEECHLAB_ENV=production, SPEECHLAB_API_KEY=...
+gunicorn -c deploy/gunicorn.conf.py wsgi:app
+```
+
+| Endpoint | Описание |
+|----------|----------|
+| `GET /health` | Статус сервиса |
+| `POST /api/v1/dub` | Запуск (multipart `video` или JSON `video_path`) |
+| `GET /api/v1/jobs/<id>` | Статус задачи |
+| `GET /api/v1/jobs/<id>/download` | Скачать `{project}_dubbed.mp4` |
+
+Опциональные поля `POST /api/v1/dub` (форма или JSON):
+
+| Поле | Описание |
+|------|----------|
+| `voice_prompt` | Промпт VoiceDesign (алиас: `voice_design_template`) |
+| `voice_gender` | `male` / `female` для всех реплик |
+| `voice_age` | Возраст в годах, напр. `35` |
+| `voice_design_temperature` | Температура TTS, 0–1 |
+| `voice_design_by_key` | JSON: промпт по ключу `male_mature`, `female_teenager`, … |
+
+Плейсхолдеры в `voice_prompt`: `{lang}`, `{gender_hint}`, `{age_hint}`.
+
+```bash
+curl -X POST https://dub.example.com/api/v1/dub \
+  -H "X-API-Key: YOUR_KEY" \
+  -F project_name=demo \
+  -F source_language=en \
+  -F target_language=ru \
+  -F voice_prompt="Warm {gender_hint} narrator, {lang}. {age_hint}, cinematic dubbing." \
+  -F voice_gender=female \
+  -F voice_age=32 \
+  -F video=@diolog.mp4
+```
+
+Заголовок `X-API-Key` обязателен при `SPEECHLAB_ENV=production`. TLS — через nginx (`deploy/nginx.conf.example`), systemd — `deploy/speechlab.service`.
+
+Проекты пишутся в `SPEECHLAB_PROJECTS_ROOT` (по умолчанию `data/projects/`), задачи — в `server/data/jobs/` (JSON на диске).
+
+---
+
 ## Структура репозитория
 
 ```text
@@ -135,6 +182,9 @@ Speech/
 │   ├── get_param.py     # пол, возраст, эмоция по WAV
 │   ├── dubbing.py       # Qwen3-TTS
 │   └── fit_audio.py     # подгонка длины и таймлайн
+├── server/              # Flask API + subprocess worker
+├── deploy/              # gunicorn, nginx, systemd
+├── wsgi.py
 ├── kaggle/
 │   ├── kaggle_one_cell.py
 │   └── README.md

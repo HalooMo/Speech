@@ -1,0 +1,3 @@
+# HTTP API (поверх requirements.txt)
+flask>=3.0.0
+gunicorn>=22.0.0

@@ -13,3 +13,9 @@ __pycache__/
 # Kaggle: ячейка с секретами + локальный пакет для датасета
 my_files/
 kaggle/kaggle_one_cell.py
+
+server/uploads/
+server/data/
+server/ssl/*.pem
+server/ssl/*.key
+data/projects/
