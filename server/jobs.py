@@ -206,6 +206,8 @@ def start_job(job: Job, projects_root: Path, logs_dir: Path) -> subprocess.Popen
     log_file = logs_dir / f"job_{job.id}.log"
     env = os.environ.copy()
     env["SPEECHLAB_PROJECTS_ROOT"] = str(projects_root.resolve())
+    venv_bin = str((ROOT / ".venv" / "bin").resolve())
+    env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
 
     cmd = [sys.executable, "-m", "server.run_job", job.id]
     kwargs: dict = {

@@ -101,7 +101,10 @@ def extract_audio_16k(video_path: Path, out_wav: Path) -> None:
 def separate_stems(audio_wav: Path, stems_dir: Path) -> tuple[Path, Path]:
     """demucs --two-stems=vocals → (vocals.wav, no_vocals.wav)."""
     stems_dir.mkdir(parents=True, exist_ok=True)
-    _run(["demucs", "--two-stems=vocals", "-o", str(stems_dir), str(audio_wav)])
+    _run([
+        sys.executable, "-m", "demucs",
+        "--two-stems=vocals", "-o", str(stems_dir), str(audio_wav),
+    ])
     candidates = list(stems_dir.rglob("vocals.wav"))
     if not candidates:
         raise FileNotFoundError(f"demucs не создал vocals.wav в {stems_dir}")
