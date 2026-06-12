@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env", override=False)
-load_dotenv(ROOT / "config" / ".env", override=False)
+load_dotenv(ROOT / "config" / ".env", override=True)
 
 from server.config import ServerConfig
 from server.jobs import JobStatus, JobStore, _utc_now

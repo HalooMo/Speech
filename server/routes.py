@@ -25,15 +25,25 @@ def _store():
     return current_app.extensions["job_store"]
 
 
+def _json_body() -> dict:
+    if not request.is_json:
+        return {}
+    return request.get_json(silent=True) or {}
+
+
 def _opt_float(key: str):
-    v = request.form.get(key) or (request.json or {}).get(key)
+    v = request.form.get(key)
+    if v is None:
+        v = _json_body().get(key)
     if v is None or v == "":
         return None
     return float(v)
 
 
 def _opt_str(key: str):
-    v = request.form.get(key) or (request.json or {}).get(key)
+    v = request.form.get(key)
+    if v is None:
+        v = _json_body().get(key)
     return (v or "").strip() or None
 
 
@@ -46,8 +56,7 @@ def _opt_str_any(*keys: str) -> str | None:
 
 
 def _parse_voice_design_by_key() -> dict | None:
-    data = request.json if request.is_json else {}
-    raw = data.get("voice_design_by_key")
+    raw = _json_body().get("voice_design_by_key")
     if isinstance(raw, dict) and raw:
         return raw
     form_raw = request.form.get("voice_design_by_key")

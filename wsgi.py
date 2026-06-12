@@ -5,7 +5,8 @@ from dotenv import load_dotenv
 
 _root = Path(__file__).resolve().parent
 load_dotenv(_root / ".env", override=False)
-load_dotenv(_root / "config" / ".env", override=False)
+# config/.env — основной файл секретов; перекрывает корневой .env
+load_dotenv(_root / "config" / ".env", override=True)
 
 from server.app import create_app
 

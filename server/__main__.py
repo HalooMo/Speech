@@ -8,7 +8,7 @@ from server.config import ServerConfig
 
 _root = Path(__file__).resolve().parent.parent
 load_dotenv(_root / ".env", override=False)
-load_dotenv(_root / "config" / ".env", override=False)
+load_dotenv(_root / "config" / ".env", override=True)
 
 
 def main() -> None:
