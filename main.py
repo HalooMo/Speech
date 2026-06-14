@@ -849,6 +849,7 @@ def run(
     voice_gender: str | None = None,
     voice_age: int | float | None = None,
     voice_design_temperature: float | None = None,
+    voice_clone_samples: list[dict] | None = None,
     projects_root: str | Path | None = None,
 ) -> Path:
     """
@@ -860,7 +861,9 @@ def run(
     voice_gender — пол для всех реплик: male / female. None → детекция по WAV.
     voice_age — возраст в годах (число), напр. 35. None → детекция по WAV.
     voice_design_temperature — температура VoiceDesign (0–1). None → DESIGN_TEMP.
-    Без кастомных промптов/температуры — банк .speechlab_voice_bank по умолчанию.
+    voice_clone_samples — аудио для клонирования: список dict с gender, path,
+      age_groups (child|teenager|mature|elderly, опц.), ref_text (опц.).
+    Без кастомных промптов/сэмплов — банк .speechlab_voice_bank по умолчанию.
     """
     video_path = Path(video_path).resolve()
     if not video_path.is_file():
@@ -876,17 +879,22 @@ def run(
         (voice_design_template or "").strip()
         or voice_design_by_key
         or voice_design_temperature is not None
+        or voice_clone_samples
     )
+    bank_dir = project_dir / "voice_bank" if use_project_bank else None
     dubbing.set_voice_prompts(
         template=voice_design_template,
         by_key=voice_design_by_key,
-        cache_dir=project_dir / "voice_bank" if use_project_bank else None,
+        cache_dir=bank_dir,
         gender=voice_gender,
         age=voice_age,
         design_temperature=voice_design_temperature,
     )
+    dubbing.set_voice_clone_samples(voice_clone_samples)
     if use_project_bank:
         print(f"  TTS: банк голоса проекта → {project_dir / 'voice_bank'}")
+    if dubbing.uses_custom_clone():
+        print(f"  TTS: клонирование из {len(voice_clone_samples or [])} аудио-сэмпл(ов)")
     if dubbing.has_voice_profile_override():
         parts = []
         if voice_gender:

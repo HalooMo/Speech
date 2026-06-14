@@ -2,6 +2,7 @@
 import gc
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,9 @@ MODEL_BASE = os.environ.get("SPEECHLAB_TTS_BASE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7
 _env_cache = os.environ.get("SPEECHLAB_VOICE_CACHE", "")
 CACHE_ROOT = Path(_env_cache).expanduser() if _env_cache else Path(__file__).resolve().parent.parent / ".speechlab_voice_bank"
 
-VOICE_KEYS = [f"{g}_{a}" for g in ("male", "female") for a in ("child", "teenager", "mature", "elderly")]
+GENDERS = ("male", "female")
+AGE_GROUPS = ("child", "teenager", "mature", "elderly")
+VOICE_KEYS = [f"{g}_{a}" for g in GENDERS for a in AGE_GROUPS]
 MAP_LANG = {
     "ru": "Russian", "russian": "Russian", "en": "English", "english": "English",
     "de": "German", "german": "German", "es": "Spanish", "spanish": "Spanish",
@@ -47,6 +50,7 @@ _clone_prompts = {}
 _active = {
     "template": None, "by_key": None, "cache_root": None,
     "gender": None, "age": None, "design_temp": None,
+    "clone_by_key": None,  # voice_key → {path, ref_text}
 }
 
 
@@ -97,11 +101,59 @@ def clear_voice_prompts():
         _active[k] = None
 
 
+def _norm_age_groups(age_groups) -> list[str]:
+    if not age_groups:
+        return list(AGE_GROUPS)
+    out: list[str] = []
+    for a in age_groups:
+        key = str(a).strip().lower()
+        if key in AGE_GROUPS and key not in out:
+            out.append(key)
+    if not out:
+        raise ValueError(f"age_groups: ожидается подмножество {AGE_GROUPS}, получено {age_groups!r}")
+    return out
+
+
+def set_voice_clone_samples(samples: list[dict] | None) -> None:
+    """Аудио-сэмплы для клонирования: пол + возрастные группы → voice_key.
+
+    samples: [{"gender": "male"|"female", "path": str|Path,
+               "age_groups": list[str]|None, "ref_text": str|None}, ...]
+    age_groups=None → все 4 группы. ref_text=None → x_vector_only_mode (ниже качество).
+    """
+    if not samples:
+        _active["clone_by_key"] = None
+        return
+    expanded: dict[str, dict] = {}
+    for spec in samples:
+        gender = _norm_gender(spec.get("gender"))
+        if not gender:
+            raise ValueError("voice_clone_samples: нужен gender (male/female)")
+        src = Path(spec["path"])
+        if not src.is_file():
+            raise FileNotFoundError(f"voice clone sample: {src}")
+        ref_text = (spec.get("ref_text") or "").strip() or None
+        for age in _norm_age_groups(spec.get("age_groups")):
+            vk = f"{gender}_{age}"
+            expanded[vk] = {"path": src.resolve(), "ref_text": ref_text}
+    _active["clone_by_key"] = expanded or None
+
+
 def uses_custom_voice():
     """Есть ли кастомные промпты/стиль в текущем прогоне."""
     return bool(
         _active["template"] or _active["by_key"] or _active["design_temp"] is not None,
     )
+
+
+def uses_custom_clone():
+    """Есть ли пользовательские аудио-сэмплы для клонирования."""
+    return bool(_active["clone_by_key"])
+
+
+def has_custom_voice_bank():
+    """Нужен ли отдельный voice_bank проекта (промпты и/или сэмплы)."""
+    return uses_custom_voice() or uses_custom_clone()
 
 
 def has_voice_profile_override():
@@ -129,38 +181,55 @@ def _bank_root():
     return _active["cache_root"] if _active["cache_root"] else CACHE_ROOT
 
 
-def _prompts_meta_path():
-    return _bank_root() / "voice_prompts.json"
+def _settings_meta_path():
+    return _bank_root() / "voice_settings.json"
 
 
-def _current_prompts_meta():
+def _clone_samples_meta() -> dict:
+    if not _active["clone_by_key"]:
+        return {}
+    meta = {}
+    for vk, spec in _active["clone_by_key"].items():
+        p = Path(spec["path"])
+        meta[vk] = {
+            "path": str(p.resolve()),
+            "mtime": p.stat().st_mtime if p.is_file() else 0,
+            "ref_text": spec.get("ref_text"),
+        }
+    return meta
+
+
+def _current_settings_meta():
     return {
-        "template": _active["template"],
-        "by_key": _active["by_key"] or {},
-        "design_temperature": _design_temp(),
+        "prompts": {
+            "template": _active["template"],
+            "by_key": _active["by_key"] or {},
+            "design_temperature": _design_temp(),
+        },
+        "clone_samples": _clone_samples_meta(),
     }
 
 
-def _prompts_changed():
-    """Кастомные промпты изменились — нужна перегенерация банка."""
-    if not uses_custom_voice():
+def _settings_changed():
+    """Кастомные настройки изменились — нужна перегенерация банка."""
+    if not has_custom_voice_bank():
         return False
-    p = _prompts_meta_path()
+    p = _settings_meta_path()
     if not p.is_file():
         return True
     try:
         saved = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return True
-    return saved != _current_prompts_meta()
+    return saved != _current_settings_meta()
 
 
-def _save_prompts_meta():
-    if not uses_custom_voice():
+def _save_settings_meta():
+    if not has_custom_voice_bank():
         return
     _bank_root().mkdir(parents=True, exist_ok=True)
-    _prompts_meta_path().write_text(
-        json.dumps(_current_prompts_meta(), ensure_ascii=False, indent=2), encoding="utf-8",
+    _settings_meta_path().write_text(
+        json.dumps(_current_settings_meta(), ensure_ascii=False, indent=2), encoding="utf-8",
     )
 
 
@@ -206,6 +275,47 @@ def normalize_voice_key(profile):
 
 def _cache_dir(lang):
     return _bank_root() / lang.lower().replace(" ", "_")
+
+
+def _clone_spec(voice_key: str) -> dict | None:
+    by_key = _active["clone_by_key"]
+    return by_key.get(voice_key) if by_key else None
+
+
+def _prepare_ref_wav(src: Path, dst: Path) -> None:
+    """mp3/wav → mono WAV для Qwen clone (ffmpeg)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vn", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+        str(dst),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = (r.stderr or "")[-2000:]
+        raise RuntimeError(f"ffmpeg не конвертировал {src.name}: {tail}")
+
+
+def _install_clone_sample(spec: dict, wav_path: Path, lang: str, voice_key: str) -> None:
+    """Пользовательский сэмпл → эталон в voice_bank."""
+    src = Path(spec["path"])
+    _prepare_ref_wav(src, wav_path)
+    ref_text = spec.get("ref_text")
+    txt_path = wav_path.with_suffix(".txt")
+    if ref_text:
+        txt_path.write_text(ref_text, encoding="utf-8")
+    elif txt_path.is_file():
+        txt_path.unlink()
+    meta = {
+        "voice_key": voice_key,
+        "source": str(src.resolve()),
+        "ref_text": ref_text,
+        "custom_clone": True,
+    }
+    (wav_path.parent / f"{voice_key}.meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    print(f"    {voice_key} ← clone sample ({src.name})")
 
 
 def _patch_talker():
@@ -266,36 +376,54 @@ def ensure_voice_bank(language, force=False):
     cache = _cache_dir(lang)
     cache.mkdir(parents=True, exist_ok=True)
 
-    if uses_custom_voice() and _prompts_changed():
+    if has_custom_voice_bank() and _settings_changed():
         force = True
 
     need = force or not all((cache / f"{vk}.wav").is_file() for vk in VOICE_KEYS)
     if need:
         import soundfile as sf
-        print(f"  TTS: 8 голосов ({lang})…")
-        design = _design_model()
-        for vk in VOICE_KEYS:
-            gender, age = vk.split("_", 1)
-            wav_path = cache / f"{vk}.wav"
-            if wav_path.is_file() and not force:
-                continue
-            line = ref_line(lang, vk)
-            instr = design_instruct(lang, gender, age, vk)
-            temp = _design_temp()
-            wavs, sr = design.generate_voice_design(
-                text=line, language=lang, instruct=instr,
-                temperature=temp, non_streaming_mode=True,
-            )
-            if not wavs:
-                raise RuntimeError(f"VoiceDesign: нет аудио для {vk}")
-            sf.write(wav_path, np.asarray(wavs[0], dtype=np.float32).squeeze(), sr)
-            (cache / f"{vk}.txt").write_text(line, encoding="utf-8")
-            (cache / f"{vk}.instruct.txt").write_text(instr, encoding="utf-8")
-            meta = {"voice_key": vk, "ref_text": line, "design_instruct": instr, "design_temperature": temp}
-            (cache / f"{vk}.meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"    {vk}")
-        _free_design()
-        _save_prompts_meta()
+        clone_keys = set(_active["clone_by_key"] or {})
+        design_keys = [vk for vk in VOICE_KEYS if vk not in clone_keys]
+        if clone_keys:
+            print(f"  TTS: clone samples ({lang})…")
+            for vk in VOICE_KEYS:
+                spec = _clone_spec(vk)
+                if not spec:
+                    continue
+                wav_path = cache / f"{vk}.wav"
+                if wav_path.is_file() and not force:
+                    continue
+                _install_clone_sample(spec, wav_path, lang, vk)
+        if design_keys:
+            print(f"  TTS: VoiceDesign ({len(design_keys)} голосов, {lang})…")
+            design = _design_model()
+            for vk in design_keys:
+                gender, age = vk.split("_", 1)
+                wav_path = cache / f"{vk}.wav"
+                if wav_path.is_file() and not force:
+                    continue
+                line = ref_line(lang, vk)
+                instr = design_instruct(lang, gender, age, vk)
+                temp = _design_temp()
+                wavs, sr = design.generate_voice_design(
+                    text=line, language=lang, instruct=instr,
+                    temperature=temp, non_streaming_mode=True,
+                )
+                if not wavs:
+                    raise RuntimeError(f"VoiceDesign: нет аудио для {vk}")
+                sf.write(wav_path, np.asarray(wavs[0], dtype=np.float32).squeeze(), sr)
+                (cache / f"{vk}.txt").write_text(line, encoding="utf-8")
+                (cache / f"{vk}.instruct.txt").write_text(instr, encoding="utf-8")
+                meta = {
+                    "voice_key": vk, "ref_text": line,
+                    "design_instruct": instr, "design_temperature": temp,
+                }
+                (cache / f"{vk}.meta.json").write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+                print(f"    {vk}")
+            _free_design()
+        _save_settings_meta()
 
     if force:
         _clone_prompts.clear()
@@ -309,9 +437,20 @@ def ensure_voice_bank(language, force=False):
         txt_path = cache / f"{vk}.txt"
         if not wav_path.is_file():
             raise FileNotFoundError(wav_path)
-        line = txt_path.read_text(encoding="utf-8").strip() if txt_path.is_file() else ref_line(lang, vk)
+        spec = _clone_spec(vk)
+        if spec and spec.get("ref_text"):
+            line = spec["ref_text"]
+            x_vector = False
+        elif txt_path.is_file():
+            line = txt_path.read_text(encoding="utf-8").strip()
+            x_vector = False
+        else:
+            line = ref_line(lang, vk)
+            x_vector = bool(spec)
         _clone_prompts[key] = base.create_voice_clone_prompt(
-            ref_audio=str(wav_path), ref_text=line, x_vector_only_mode=False,
+            ref_audio=str(wav_path),
+            ref_text=line,
+            x_vector_only_mode=x_vector,
         )
 
 

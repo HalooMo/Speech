@@ -1,0 +1,563 @@
+================================================================================
+  SpeechLab — руководство клиента по работе с API дубляжа
+================================================================================
+
+Сервис принимает видео или аудио, переводит диалог и собирает закадровый
+многоголосый дубляж. Результат — MP4-файл {project_name}_dubbed.mp4.
+
+Базовый URL сервера (пример):
+  https://vandum.ru
+
+Все запросы, кроме проверки здоровья, требуют API-ключ.
+
+
+--------------------------------------------------------------------------------
+1. Аутентификация
+--------------------------------------------------------------------------------
+
+Получите API-ключ у администратора сервера (переменная SPEECHLAB_API_KEY).
+
+Передавайте ключ в КАЖДОМ запросе одним из способов:
+
+  Заголовок (рекомендуется):
+    X-API-Key: ВАШ_КЛЮЧ
+
+  Альтернатива:
+    Authorization: Bearer ВАШ_КЛЮЧ
+
+Важно:
+  - Имя заголовка именно X-API-Key (регистр букв не важен для HTTP, но
+    не пишите X-API-key с опечаткой в клиентском коде).
+  - Без ключа ответ: 401 {"error":"Неверный или отсутствующий API key (X-API-Key)"}
+
+
+--------------------------------------------------------------------------------
+2. Проверка доступности сервера
+--------------------------------------------------------------------------------
+
+GET /health — без API-ключа.
+
+  curl https://vandum.ru/health
+
+Пример ответа:
+  {
+    "status": "ok",
+    "service": "speechlab",
+    "env": "production",
+    "active_job": "b5d778b84a21"
+  }
+
+  active_job — id текущей задачи в очереди/работе, или null если сервер свободен.
+
+
+--------------------------------------------------------------------------------
+3. Общая схема работы
+--------------------------------------------------------------------------------
+
+  1) POST /api/v1/dub     — отправить видео и параметры, получить job id
+  2) GET  /api/v1/jobs/<id> — опрашивать статус (queued → running → done)
+  3) GET  /api/v1/jobs/<id>/download — скачать готовый MP4
+
+На сервере одновременно выполняется только ОДНА задача (GPU).
+Если пайплайн уже занят — ответ 503 с active_job_id.
+
+
+--------------------------------------------------------------------------------
+4. Запуск дубляжа — POST /api/v1/dub
+--------------------------------------------------------------------------------
+
+Два способа передать видео:
+
+  A) multipart/form-data — загрузка файла с вашего компьютера (основной способ)
+  B) application/json    — путь к файлу уже на сервере (video_path)
+
+Обязательные поля:
+  project_name      — имя проекта: буквы, цифры, _ и - (до 64 символов)
+  source_language   — язык оригинала (en, ru, de, es, fr, auto, …)
+  target_language   — язык дубляжа
+  video             — файл (multipart) ИЛИ video_path (JSON, путь на сервере)
+
+Поддерживаемые форматы видео/аудио:
+  .mp4 .mkv .mov .avi .webm .wav .mp3 .m4a
+
+Максимальный размер загрузки по умолчанию: 500 МБ (SPEECHLAB_MAX_UPLOAD_MB).
+
+
+--- 4.1. Загрузка файла (multipart) — Windows CMD ---
+
+curl.exe -X POST "https://vandum.ru/api/v1/dub" ^
+  -H "X-API-Key: ВАШ_КЛЮЧ" ^
+  -F "project_name=demo" ^
+  -F "source_language=en" ^
+  -F "target_language=ru" ^
+  -F "video=@C:\Users\Имя\Videos\diolog.mp4"
+
+--- 4.2. Загрузка с настройкой голоса (VoiceDesign) ---
+
+curl.exe -X POST "https://vandum.ru/api/v1/dub" ^
+  -H "X-API-Key: ВАШ_КЛЮЧ" ^
+  -F "project_name=demo" ^
+  -F "source_language=en" ^
+  -F "target_language=ru" ^
+  -F "voice_prompt=Warm {gender_hint} narrator, {lang}. {age_hint}, cinematic dubbing." ^
+  -F "voice_gender=female" ^
+  -F "voice_age=32" ^
+  -F "voice_design_temperature=0.72" ^
+  -F "video=@C:\Users\Имя\Videos\diolog.mp4"
+
+--- 4.3. PowerShell (удобнее с путями) ---
+
+curl.exe -X POST "https://vandum.ru/api/v1/dub" `
+  -H "X-API-Key: ВАШ_КЛЮЧ" `
+  -F "project_name=demo" `
+  -F "source_language=en" `
+  -F "target_language=ru" `
+  -F "video=@$env:USERPROFILE\Videos\diolog.mp4"
+
+--- 4.4. Linux / macOS ---
+
+curl -X POST "https://vandum.ru/api/v1/dub" \
+  -H "X-API-Key: ВАШ_КЛЮЧ" \
+  -F "project_name=demo" \
+  -F "source_language=en" \
+  -F "target_language=ru" \
+  -F "video=@/home/user/diolog.mp4"
+
+--- 4.5. JSON (файл уже лежит на сервере) ---
+
+curl -X POST "https://vandum.ru/api/v1/dub" \
+  -H "X-API-Key: ВАШ_КЛЮЧ" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_name": "demo",
+    "source_language": "en",
+    "target_language": "ru",
+    "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
+    "voice_prompt": "Natural {gender_hint}, {lang}. {age_hint}.",
+    "voice_gender": "male",
+    "voice_age": 40
+  }'
+
+Ответ при успехе: HTTP 202 Accepted
+
+Пример:
+  {
+    "id": "af737c8057f1",
+    "status": "queued",
+    "project_name": "demo",
+    "source_language": "en",
+    "target_language": "ru",
+    "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
+    "created_at": "2026-06-13T17:00:22.422162+00:00",
+    "started_at": null,
+    "finished_at": null,
+    "result_path": null,
+    "error": null,
+    "options": {
+      "voice_design_template": "Warm ...",
+      "voice_gender": "female",
+      "voice_age": 32
+    },
+    "pid": 26832
+  }
+
+Сохраните поле "id" — это идентификатор задачи для опроса и скачивания.
+
+
+--------------------------------------------------------------------------------
+5. Опциональные параметры дубляжа
+--------------------------------------------------------------------------------
+
+Передаются в той же форме (multipart) или в JSON-теле POST /api/v1/dub.
+
+Голос (Qwen3-TTS VoiceDesign):
+  voice_prompt              — текст промпта для дизайна голоса
+  voice_design_template     — то же, что voice_prompt
+  voice_design_prompt       — то же, что voice_prompt
+  voice_gender / gender     — male | female (для всех реплик)
+  voice_age                 — возраст в годах, число (напр. 32)
+  voice_design_temperature  — 0..1, «креативность» TTS (по умолчанию ~0.72)
+  voice_design_by_key       — JSON: промпт отдельно для типа голоса
+
+Плейсхолдеры в voice_prompt:
+  {lang}         — язык дубляжа (Russian, English, …)
+  {gender_hint}  — masculine male voice / feminine female voice
+  {age_hint}     — child | teen | adult
+
+Ключи voice_design_by_key (пол × возрастная группа):
+  male_child, male_teenager, male_mature, male_elderly
+  female_child, female_teenager, female_mature, female_elderly
+
+Пример voice_design_by_key в multipart (строка JSON):
+  -F 'voice_design_by_key={"male_mature":"deep baritone narrator","female_teenager":"bright young voice"}'
+
+Пример в JSON-теле:
+  "voice_design_by_key": {
+    "male_mature": "deep baritone narrator",
+    "female_teenager": "bright young voice"
+  }
+
+Громкость и микс:
+  dub_volume_percent      — громкость дубляжа, % (по умолчанию 100)
+  original_audio_ratio    — доля оригинальной дорожки в финале (0..1, по умолчанию 0.3)
+
+Если voice_gender / voice_age не заданы — пол и возраст определяются автоматически
+по аудио каждой реплики (casting).
+
+
+--- 5.1. Клонирование голоса из аудио-сэмпла (опционально) ---
+
+Можно передать короткий аудио-файл (.mp3 или .wav, до 10 МБ) вместо генерации
+голоса только через текстовый промпт. Сэмпл задаётся отдельно для мужского
+и/или женского пола.
+
+Возрастные группы (4 штуки):
+  child      — ребёнок
+  teenager   — подросток
+  mature     — взрослый
+  elderly    — пожилой
+
+Поля multipart:
+  voice_sample_male           — файл mp3/wav (опционально)
+  voice_sample_female         — файл mp3/wav (опционально)
+  voice_sample_male_ages      — child,teenager,mature,elderly (опционально)
+  voice_sample_female_ages    — то же (опционально)
+  voice_sample_male_ref_text  — точный текст, произнесённый в сэмпле (рекомендуется)
+  voice_sample_female_ref_text
+
+Если *_ages не указаны — сэмпл применяется ко ВСЕМ 4 возрастным группам
+данного пола. Например, voice_sample_male без ages → male_child, male_teenager,
+male_mature, male_elderly используют один и тот же голос.
+
+Если сэмпл не передан — голос генерируется по текущей схеме (VoiceDesign +
+промпт, если задан). Можно комбинировать: сэмпл для male, промпт для female.
+
+Рекомендации к сэмплу:
+  - 3–10 секунд чистой речи без музыки и шума
+  - один спикер, нормальная громкость
+  - ref_text должен дословно совпадать с тем, что сказано в сэмпле
+
+Пример — только мужской голос для взрослых и пожилых (Windows CMD):
+
+  curl.exe -X POST "https://vandum.ru/api/v1/dub" ^
+    -H "X-API-Key: ВАШ_КЛЮЧ" ^
+    -F "project_name=demo" ^
+    -F "source_language=en" ^
+    -F "target_language=ru" ^
+    -F "voice_sample_male=@C:\Users\Имя\voice_male.wav" ^
+    -F "voice_sample_male_ages=mature,elderly" ^
+    -F "voice_sample_male_ref_text=Hello, this is my reference voice sample." ^
+    -F "video=@C:\Users\Имя\Videos\diolog.mp4"
+
+Пример — оба пола, все возраста (PowerShell):
+
+  curl.exe -X POST "https://vandum.ru/api/v1/dub" `
+    -H "X-API-Key: ВАШ_КЛЮЧ" `
+    -F "project_name=demo" `
+    -F "source_language=en" `
+    -F "target_language=ru" `
+    -F "voice_sample_male=@$env:USERPROFILE\voice_m.wav" `
+    -F "voice_sample_female=@$env:USERPROFILE\voice_f.wav" `
+    -F "video=@$env:USERPROFILE\Videos\diolog.mp4"
+
+JSON (файлы уже на сервере):
+
+  curl -X POST "https://vandum.ru/api/v1/dub" \
+    -H "X-API-Key: ВАШ_КЛЮЧ" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "project_name": "demo",
+      "source_language": "en",
+      "target_language": "ru",
+      "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
+      "voice_clone_samples": [
+        {
+          "gender": "male",
+          "sample_path": "/opt/speechlab/server/uploads/voice_samples/demo_male.wav",
+          "age_groups": ["mature", "elderly"],
+          "ref_text": "Hello, this is my reference voice sample."
+        },
+        {
+          "gender": "female",
+          "sample_path": "/opt/speechlab/server/uploads/voice_samples/demo_female.mp3"
+        }
+      ]
+    }'
+
+Расширенный JSON в multipart (поле voice_clone_samples — строка JSON):
+
+  -F 'voice_clone_samples=[{"gender":"male","age_groups":["mature"],"ref_text":"..."}]' \
+  -F "voice_sample_male=@voice.wav"
+
+Как это работает на сервере:
+  - Слоты с сэмплом: референс конвертируется в WAV и клонируется через Qwen3-TTS
+  - Слоты без сэмпла: голос создаётся моделью VoiceDesign (промпт или дефолт)
+  - Озвучка всех реплик: Qwen3-TTS Base clone по профилю casting (пол + возраст)
+
+
+--------------------------------------------------------------------------------
+6. Статус задачи — GET /api/v1/jobs/<job_id>
+--------------------------------------------------------------------------------
+
+  curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" ^
+    "https://vandum.ru/api/v1/jobs/af737c8057f1"
+
+Статусы (поле status):
+  queued   — в очереди
+  running  — пайплайн выполняется (обычно 10–40+ минут в зависимости от длины)
+  done     — готово, можно скачивать
+  error    — ошибка, смотрите поле error
+
+Пример готовой задачи:
+  {
+    "id": "af737c8057f1",
+    "status": "done",
+    "result_path": "/opt/speechlab/data/projects/demo/demo_dubbed.mp4",
+    "finished_at": "2026-06-13T17:06:38.494300+00:00",
+    "error": null,
+    ...
+  }
+
+Опрос в цикле (Linux/macOS):
+  while true; do
+    curl -s -H "X-API-Key: ВАШ_КЛЮЧ" \
+      "https://vandum.ru/api/v1/jobs/af737c8057f1" | jq .status
+    sleep 30
+  done
+
+Windows PowerShell:
+  while ($true) {
+    curl.exe -s -H "X-API-Key: ВАШ_КЛЮЧ" `
+      "https://vandum.ru/api/v1/jobs/af737c8057f1"
+    Start-Sleep -Seconds 30
+  }
+
+
+--------------------------------------------------------------------------------
+7. Список задач — GET /api/v1/jobs
+--------------------------------------------------------------------------------
+
+  curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" "https://vandum.ru/api/v1/jobs"
+
+Возвращает до 50 последних задач (массив JSON), от новых к старым.
+
+
+--------------------------------------------------------------------------------
+8. Скачивание результата — GET /api/v1/jobs/<job_id>/download
+--------------------------------------------------------------------------------
+
+Доступно только при status = "done".
+
+--- Windows CMD (правильный синтаксис) ---
+
+curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" ^
+  --output "C:\Users\Имя\Downloads\demo_dubbed.mp4" ^
+  "https://vandum.ru/api/v1/jobs/af737c8057f1/download"
+
+Важно: флаг --output идёт ПЕРЕД URL. URL должен быть последним аргументом.
+
+--- PowerShell ---
+
+curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" `
+  -o "$env:USERPROFILE\Downloads\demo_dubbed.mp4" `
+  "https://vandum.ru/api/v1/jobs/af737c8057f1/download"
+
+--- Linux / macOS ---
+
+curl -H "X-API-Key: ВАШ_КЛЮЧ" \
+  -o ~/Downloads/demo_dubbed.mp4 \
+  "https://vandum.ru/api/v1/jobs/af737c8057f1/download"
+
+Если задача ещё не готова: HTTP 409
+  {"error":"Результат ещё не готов","status":"running"}
+
+
+--------------------------------------------------------------------------------
+9. Коды ответов и типичные ошибки
+--------------------------------------------------------------------------------
+
+  200  OK           — GET запросы, скачивание файла
+  202  Accepted     — задача создана (POST /api/v1/dub)
+  400  Bad Request  — не хватает полей, неверный project_name
+  401  Unauthorized — неверный или отсутствующий API key
+  403  Forbidden    — video_path вне разрешённых каталогов
+  409  Conflict     — скачивание до завершения задачи
+  413  Too Large    — файл больше лимита загрузки
+  503  Unavailable  — пайплайн уже занят другой задачей
+
+Пример 503:
+  {
+    "error": "Пайплайн уже выполняется",
+    "active_job_id": "b5d778b84a21"
+  }
+
+Действие: дождитесь завершения active_job_id или опрашивайте его статус.
+
+
+--------------------------------------------------------------------------------
+10. Полный сценарий «от загрузки до MP4» (Windows)
+--------------------------------------------------------------------------------
+
+Шаг 1 — отправить видео:
+
+  curl.exe -X POST "https://vandum.ru/api/v1/dub" ^
+    -H "X-API-Key: ВАШ_КЛЮЧ" ^
+    -F "project_name=myfilm" ^
+    -F "source_language=en" ^
+    -F "target_language=ru" ^
+    -F "voice_gender=female" ^
+    -F "voice_age=30" ^
+    -F "video=@C:\path\to\video.mp4"
+
+Из ответа скопируйте id, например: a1b2c3d4e5f6
+
+Шаг 2 — проверять статус (повторять каждые 1–2 минуты):
+
+  curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" ^
+    "https://vandum.ru/api/v1/jobs/a1b2c3d4e5f6"
+
+Шаг 3 — когда status = "done", скачать:
+
+  curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" ^
+    -o "C:\Users\Имя\Downloads\myfilm_dubbed.mp4" ^
+    "https://vandum.ru/api/v1/jobs/a1b2c3d4e5f6/download"
+
+
+--------------------------------------------------------------------------------
+11. Пример на Python (requests)
+--------------------------------------------------------------------------------
+
+  import time
+  import requests
+
+  BASE = "https://vandum.ru"
+  API_KEY = "ВАШ_КЛЮЧ"
+  HEADERS = {"X-API-Key": API_KEY}
+
+  # 1. Запуск
+  with open(r"C:\path\to\diolog.mp4", "rb") as f:
+      r = requests.post(
+          f"{BASE}/api/v1/dub",
+          headers=HEADERS,
+          data={
+              "project_name": "demo",
+              "source_language": "en",
+              "target_language": "ru",
+              "voice_prompt": "Natural {gender_hint}, {lang}. {age_hint}.",
+              "voice_gender": "female",
+              "voice_age": "32",
+          },
+          files={"video": ("diolog.mp4", f, "video/mp4")},
+          timeout=600,
+      )
+  r.raise_for_status()
+  job_id = r.json()["id"]
+  print("job:", job_id)
+
+  # 2. Ожидание
+  while True:
+      st = requests.get(f"{BASE}/api/v1/jobs/{job_id}", headers=HEADERS, timeout=60)
+      st.raise_for_status()
+      data = st.json()
+      print("status:", data["status"])
+      if data["status"] == "done":
+          break
+      if data["status"] == "error":
+          raise RuntimeError(data.get("error"))
+      time.sleep(60)
+
+  # 3. Скачивание
+  out = requests.get(
+      f"{BASE}/api/v1/jobs/{job_id}/download",
+      headers=HEADERS,
+      stream=True,
+      timeout=600,
+  )
+  out.raise_for_status()
+  with open("demo_dubbed.mp4", "wb") as f:
+      for chunk in out.iter_content(chunk_size=1024 * 1024):
+          f.write(chunk)
+  print("saved: demo_dubbed.mp4")
+
+
+--------------------------------------------------------------------------------
+12. Ограничения и рекомендации
+--------------------------------------------------------------------------------
+
+  - Один активный job на сервер: не отправляйте второй запрос, пока первый
+    в статусе queued или running.
+  - project_name используйте уникальный для разных роликов или перезаписывайте
+    осознанно — артефакты проекта хранятся на сервере в data/projects/.
+  - Длительность обработки: короткий ролик ~10–20 мин, длинный — дольше.
+  - Языки source/target: коды ISO-подобные (en, ru) или полные имена — как в CLI.
+  - Дубляж закадровый: не синхронизация губ, не клон голоса актёра.
+  - При status = error обратитесь к администратору с job id и текстом error.
+
+
+--------------------------------------------------------------------------------
+13. Краткая шпаргалка эндпоинтов
+--------------------------------------------------------------------------------
+
+  GET  /health                        — ping (без ключа)
+  POST /api/v1/dub                    — создать задачу
+  GET  /api/v1/jobs                   — список задач
+  GET  /api/v1/jobs/<id>              — статус задачи
+  GET  /api/v1/jobs/<id>/download     — скачать MP4
+
+Заголовок для всех, кроме /health:
+  X-API-Key: ВАШ_КЛЮЧ
+
+
+--------------------------------------------------------------------------------
+14. Обновление облачного сервера (для администратора)
+--------------------------------------------------------------------------------
+
+После выхода новой версии с поддержкой voice_sample_* выполните на сервере
+(SSH под root или deploy-пользователем):
+
+  # 1. Остановить сервис
+  systemctl stop speechlab
+
+  # 2. Обновить код
+  cd /opt/speechlab
+  git pull
+
+  # 3. Зависимости (если менялся requirements.txt)
+  sudo -u speechlab /opt/speechlab/.venv/bin/pip install -r requirements.txt -r requirements-server.txt
+
+  # 4. Системные пакеты (ffmpeg уже нужен; для mp3-сэмплов достаточно ffmpeg)
+  apt-get update && apt-get install -y ffmpeg sox libsndfile1
+
+  # 5. Каталог для загружаемых сэмплов
+  mkdir -p /opt/speechlab/server/uploads/voice_samples
+  chown -R speechlab:speechlab /opt/speechlab/server/uploads
+
+  # 6. Проверка синтаксиса
+  sudo -u speechlab /opt/speechlab/.venv/bin/python -m py_compile tools/dubbing.py server/routes.py main.py
+
+  # 7. Запуск
+  systemctl daemon-reload
+  systemctl start speechlab
+  systemctl status speechlab
+
+  # 8. Smoke-test
+  curl -s https://vandum.ru/health
+  curl -s -H "X-API-Key: ВАШ_КЛЮЧ" https://vandum.ru/api/v1/jobs
+
+При git pull конфликтах (локальные правки на сервере):
+
+  cd /opt/speechlab
+  git stash
+  git pull
+  # или: git checkout -- server/config.py wsgi.py  (если правили вручную)
+
+Если порт 8080 занят старым gunicorn:
+
+  pkill -f "gunicorn.*wsgi:app"
+  systemctl start speechlab
+
+Логи воркера задачи:
+
+  tail -f /opt/speechlab/server/data/logs/job_<JOB_ID>.log
+
+================================================================================

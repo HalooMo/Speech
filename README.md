@@ -147,7 +147,16 @@ gunicorn -c deploy/gunicorn.conf.py wsgi:app
 | `voice_design_temperature` | Температура TTS, 0–1 |
 | `voice_design_by_key` | JSON: промпт по ключу `male_mature`, `female_teenager`, … |
 
-Плейсхолдеры в `voice_prompt`: `{lang}`, `{gender_hint}`, `{age_hint}`.
+Клонирование из аудио-сэмпла (опционально, `.mp3`/`.wav` до 10 МБ):
+
+| Поле | Описание |
+|------|----------|
+| `voice_sample_male` / `voice_sample_female` | Файл-сэмпл для клонирования |
+| `voice_sample_*_ages` | `child,teenager,mature,elderly` или JSON-массив; пусто = все 4 |
+| `voice_sample_*_ref_text` | Точная транскрипт сэмпла (улучшает качество клона) |
+| `voice_clone_samples` | JSON-массив расширенного формата (см. `for_client.txt`) |
+
+Слоты без сэмпла озвучиваются через VoiceDesign; с сэмплом — клонирование по референсу.
 
 ```bash
 curl -X POST https://dub.example.com/api/v1/dub \
@@ -158,6 +167,20 @@ curl -X POST https://dub.example.com/api/v1/dub \
   -F voice_prompt="Warm {gender_hint} narrator, {lang}. {age_hint}, cinematic dubbing." \
   -F voice_gender=female \
   -F voice_age=32 \
+  -F video=@diolog.mp4
+```
+
+С клонированием из аудио-сэмпла:
+
+```bash
+curl -X POST https://dub.example.com/api/v1/dub \
+  -H "X-API-Key: YOUR_KEY" \
+  -F project_name=demo \
+  -F source_language=en \
+  -F target_language=ru \
+  -F voice_sample_male=@narrator.wav \
+  -F voice_sample_male_ages=mature,elderly \
+  -F voice_sample_male_ref_text="Exact words in the sample." \
   -F video=@diolog.mp4
 ```
 

@@ -49,6 +49,7 @@ def main() -> int:
             voice_gender=opts.get("voice_gender"),
             voice_age=opts.get("voice_age"),
             voice_design_temperature=opts.get("voice_design_temperature"),
+            voice_clone_samples=opts.get("voice_clone_samples"),
         )
         store.update(
             job_id,
