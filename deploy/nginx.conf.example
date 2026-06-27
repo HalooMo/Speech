@@ -1,5 +1,6 @@
 # TLS-терминация перед Gunicorn (SPEECHLAB_ENV=production, API key обязателен).
 # Скопируйте в sites-available и подставьте домен / пути к сертификатам.
+# Продакшен: app.vandum.ru
 
 upstream speechlab_api {
     server 127.0.0.1:8080;
@@ -8,10 +9,10 @@ upstream speechlab_api {
 
 server {
     listen 443 ssl http2;
-    server_name dub.example.com;
+    server_name app.vandum.ru;
 
-    ssl_certificate     /etc/letsencrypt/live/dub.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/dub.example.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/app.vandum.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.vandum.ru/privkey.pem;
 
     client_max_body_size 500M;
 
@@ -31,6 +32,15 @@ server {
 
 server {
     listen 80;
-    server_name dub.example.com;
+    server_name app.vandum.ru;
     return 301 https://$host$request_uri;
 }
+
+# Опционально: редирект со старого корневого домена на поддомен API
+# server {
+#     listen 443 ssl http2;
+#     server_name vandum.ru www.vandum.ru;
+#     ssl_certificate     /etc/letsencrypt/live/vandum.ru/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/vandum.ru/privkey.pem;
+#     return 301 https://app.vandum.ru$request_uri;
+# }

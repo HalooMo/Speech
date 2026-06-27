@@ -1,4 +1,12 @@
-"""REST API дубляжа."""
+"""REST API дубляжа.
+
+Эндпоинты:
+  GET  /health              — проверка сервиса
+  POST /api/v1/dub          — создать задачу (multipart video или JSON video_path)
+  GET  /api/v1/jobs         — список задач
+  GET  /api/v1/jobs/<id>    — статус
+  GET  /api/v1/jobs/<id>/download — скачать MP4 при status=done
+"""
 from __future__ import annotations
 
 import json
@@ -20,6 +28,7 @@ _VOICE_AGE_GROUPS = frozenset({"child", "teenager", "mature", "elderly"})
 _MAX_VOICE_SAMPLE_BYTES = 10 * 1024 * 1024
 
 
+# --- Доступ к конфигу и JobStore из Flask current_app ---
 def _cfg():
     return current_app.extensions["server_config"]
 
@@ -43,6 +52,22 @@ def _opt_float(key: str):
     return float(v)
 
 
+def _opt_bool(key: str) -> bool | None:
+    v = request.form.get(key)
+    if v is None:
+        v = _json_body().get(key)
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{key}: ожидается true/false, получено {v!r}")
+
+
 def _opt_str(key: str):
     v = request.form.get(key)
     if v is None:
@@ -50,6 +75,7 @@ def _opt_str(key: str):
     return (v or "").strip() or None
 
 
+# --- Парсинг полей формы / JSON (multipart и application/json) ---
 def _opt_str_any(*keys: str) -> str | None:
     for key in keys:
         v = _opt_str(key)
@@ -58,6 +84,7 @@ def _opt_str_any(*keys: str) -> str | None:
     return None
 
 
+# --- VoiceDesign: шаблоны промптов по ключу (male_mature и т.д.) ---
 def _parse_voice_design_by_key() -> dict | None:
     raw = _json_body().get("voice_design_by_key")
     if isinstance(raw, dict) and raw:
@@ -73,6 +100,7 @@ def _parse_voice_design_by_key() -> dict | None:
     return None
 
 
+# --- Валидация возрастных групп для клонирования голоса ---
 def _parse_age_groups(raw: str | list | None) -> list[str] | None:
     """None → все 4 возрастные группы."""
     if raw is None or raw == "":
@@ -111,6 +139,7 @@ def _norm_clone_gender(raw: str | None) -> str | None:
     raise ValueError(f"gender: ожидается male/female, получено {raw!r}")
 
 
+# --- Сохранение загруженного voice sample (mp3/wav до 10 МБ) ---
 def _save_voice_sample_file(cfg, project_name: str, gender: str, f) -> Path:
     if not f or not f.filename:
         raise ValueError(f"voice_sample_{gender}: пустой файл")
@@ -148,6 +177,7 @@ def _append_clone_sample(
     })
 
 
+# --- Клонирование голоса: JSON-массив, form JSON или voice_sample_male/female ---
 def _parse_voice_clone_samples(cfg, project_name: str) -> list[dict] | None:
     """Сэмплы клонирования: multipart-файлы, JSON-массив или form JSON."""
     samples: list[dict] = []
@@ -244,6 +274,82 @@ def _parse_voice_clone_samples(cfg, project_name: str) -> list[dict] | None:
     return samples or None
 
 
+# --- Silero TTS (только target_language ru) ---
+def _validate_silero_voices(raw: list) -> list[dict]:
+    """Проверка silero_voices: speaker, gender?, age_groups?."""
+    from tools import silero_tts
+
+    out: list[dict] = []
+    errors: list[str] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            errors.append(f"silero_voices[{i}]: ожидается объект")
+            continue
+        try:
+            spk = silero_tts.normalize_speaker(item.get("speaker") or "")
+        except ValueError as exc:
+            errors.append(f"silero_voices[{i}]: {exc}")
+            continue
+        gender = item.get("gender")
+        if gender is not None:
+            try:
+                gender = _norm_clone_gender(gender)
+            except ValueError as exc:
+                errors.append(f"silero_voices[{i}]: {exc}")
+                continue
+        try:
+            ages = _parse_age_groups(item.get("age_groups"))
+        except ValueError as exc:
+            errors.append(f"silero_voices[{i}]: {exc}")
+            continue
+        entry: dict = {"speaker": spk}
+        if gender:
+            entry["gender"] = gender
+        if ages is not None:
+            entry["age_groups"] = ages
+        out.append(entry)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return out
+
+
+def _parse_silero_voices() -> list[dict] | None:
+    raw = _json_body().get("silero_voices")
+    if isinstance(raw, list) and raw:
+        return _validate_silero_voices(raw)
+    form_raw = request.form.get("silero_voices")
+    if form_raw:
+        try:
+            parsed = json.loads(form_raw)
+        except json.JSONDecodeError:
+            raise ValueError("silero_voices: невалидный JSON") from None
+        if isinstance(parsed, list) and parsed:
+            return _validate_silero_voices(parsed)
+    return None
+
+
+def _parse_silero_options() -> dict:
+    """Silero v5_ru: speaker, all_replicas, age_groups, silero_voices."""
+    opts: dict = {}
+    speaker = _opt_str_any("silero_speaker", "silero_voice")
+    if speaker:
+        opts["silero_speaker"] = speaker
+    all_rep = _opt_bool("silero_all_replicas")
+    if all_rep is not None:
+        opts["silero_all_replicas"] = all_rep
+    raw_ages = request.form.get("silero_age_groups")
+    if raw_ages is None:
+        raw_ages = _json_body().get("silero_age_groups")
+    ages = _parse_age_groups(raw_ages)
+    if ages is not None:
+        opts["silero_age_groups"] = ages
+    voices = _parse_silero_voices()
+    if voices:
+        opts["silero_voices"] = voices
+    return opts
+
+
+# --- Опции дубляжа: громкость, VoiceDesign, температура ---
 def _parse_options() -> dict:
     """Опции дубляжа: голос, громкость, промпт VoiceDesign."""
     voice_prompt = _opt_str_any(
@@ -265,14 +371,21 @@ def _parse_options() -> dict:
     return {k: v for k, v in opts.items() if v is not None}
 
 
+# --- Сборка всех опций для передачи в job.options → main.run() ---
 def _merge_options(project_name: str) -> dict:
     opts = _parse_options()
     clone_samples = _parse_voice_clone_samples(_cfg(), project_name)
     if clone_samples:
         opts["voice_clone_samples"] = clone_samples
+    try:
+        silero = _parse_silero_options()
+    except ValueError:
+        raise
+    opts.update(silero)
     return opts
 
 
+# --- GET /health — без API key, для nginx/monitoring ---
 @bp.get("/health")
 def health():
     cfg = _cfg()
@@ -285,6 +398,7 @@ def health():
     })
 
 
+# --- POST /api/v1/dub — создание задачи и запуск subprocess ---
 @bp.post("/api/v1/dub")
 def create_dub():
     """Запуск дубляжа: multipart (video) или JSON {video_path, project_name, ...}.
@@ -303,10 +417,18 @@ def create_dub():
         (пусто = все 4 группы)
       voice_sample_male_ref_text / voice_sample_female_ref_text — транскрипт сэмпла
       voice_clone_samples — JSON-массив (расширенный формат)
+
+    Silero TTS (только target_language ru):
+      silero_speaker — aidar | baya | eugene | kseniya | xenia
+      silero_all_replicas — true: все реплики одним спикером
+      silero_age_groups — child,teenager,mature,elderly (пусто = все)
+      silero_voices — JSON [{speaker, gender?, age_groups?}, ...]
     """
     cfg = _cfg()
     store = _store()
 
+    # Ветка 1: JSON с video_path (файл уже на сервере)
+    # Ветка 2: multipart — сохраняем upload в server/uploads/
     if request.is_json:
         data = request.get_json(silent=True) or {}
         project_name = (data.get("project_name") or "").strip()
@@ -345,11 +467,13 @@ def create_dub():
             video_path.unlink(missing_ok=True)
             return jsonify({"error": str(exc)}), 400
 
+    # Валидация имени проекта и пути к видео (security.allowed_video_path)
     if not _PROJECT_RE.match(project_name):
         return jsonify({"error": "project_name: только буквы, цифры, _ и - (до 64)"}), 400
     if not allowed_video_path(video_path, cfg.video_roots):
         return jsonify({"error": "video_path вне разрешённых каталогов upload/projects"}), 403
 
+    # Очередь: одна GPU-задача; при занятости — 503
     job = store.enqueue(project_name, video_path, source_lang, target_lang, options)
     if not job:
         return jsonify({
@@ -362,11 +486,13 @@ def create_dub():
     return jsonify(store.to_dict(store.get(job.id))), 202
 
 
+# --- GET /api/v1/jobs — последние 50 задач ---
 @bp.get("/api/v1/jobs")
 def list_jobs():
     return jsonify([_store().to_dict(j) for j in _store().list_jobs()])
 
 
+# --- GET /api/v1/jobs/<id> — опрос статуса (queued → running → done) ---
 @bp.get("/api/v1/jobs/<job_id>")
 def get_job(job_id: str):
     job = _store().get(job_id)
@@ -375,6 +501,7 @@ def get_job(job_id: str):
     return jsonify(_store().to_dict(job))
 
 
+# --- GET /api/v1/jobs/<id>/download — MP4 только при status=done ---
 @bp.get("/api/v1/jobs/<job_id>/download")
 def download_job(job_id: str):
     cfg = _cfg()

@@ -1,8 +1,13 @@
 """
 SpeechLab — закадровый дубляж по PRD.md.
 
-Точка входа: run(project_name, video_path, source_language, target_language, …voice_*)
-→ Path к {project}_dubbed.mp4 и dub_output_path.txt
+Точки входа:
+  - CLI: python main.py <project> <video> <src> <tgt>
+  - API: server/run_job.py → run(...)
+
+Пайплайн _run_pipeline (9 шагов):
+  1 demucs   2 first_seg   3 ASR(test.py)   4 перевод LLM
+  5 casting  6 TTS         7 fit+overlay    8 full_dub   9 mux MP4
 """
 from __future__ import annotations
 
@@ -23,8 +28,9 @@ from test import init_asr_models, run_segment_pipeline, unload_asr_models
 from tools import llm
 
 ROOT = Path(__file__).resolve().parent
-SR = 16000
+SR = 16000  # единая частота дискретизации по всему пайплайну (PRD: 16 kHz)
 
+# --- Регулярки для файлов реплик speech_NNN_speaker_start-ends.wav и speech_N.txt ---
 SPEECH_TXT = re.compile(r"^speech_(\d+)\.txt$", re.I)
 SPEECH_WAV = re.compile(
     r"^speech_(\d{3})_([^_]+)_([\d.]+)-([\d.]+)s\.wav$",
@@ -47,10 +53,12 @@ TTS_LANGUAGE = {
 }
 
 
+# --- Маппинг кода языка → имя для Qwen TTS ---
 def _tts_language(code: str) -> str:
     return TTS_LANGUAGE.get(code.strip().lower(), code)
 
 
+# --- Обёртка subprocess: лог команды, raise при ошибке ---
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
     print("$", " ".join(cmd))
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -67,6 +75,7 @@ def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
 _AUDIO_ONLY_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac"}
 
 
+# --- ffprobe: есть ли видеопоток (для mux vs audio-only MP4) ---
 def _has_video_stream(path: Path) -> bool:
     if path.suffix.lower() in _AUDIO_ONLY_EXTS:
         return False
@@ -83,11 +92,14 @@ def _has_video_stream(path: Path) -> bool:
 
 
 def _audio_duration(path: Path) -> float:
+    """Длительность WAV через soundfile (для таймлайна и нарезки)."""
     info = sf.info(path)
     return info.frames / info.samplerate
 
 
-# --- ffmpeg: извлечение и demucs ---
+# =============================================================================
+# Шаг 1 PRD: ffmpeg — извлечение аудио и demucs (голос / музыка+шум)
+# =============================================================================
 def extract_audio_16k(video_path: Path, out_wav: Path) -> None:
     """Аудио из видео/файла → mono 16 kHz (вход demucs)."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -115,6 +127,7 @@ def separate_stems(audio_wav: Path, stems_dir: Path) -> tuple[Path, Path]:
     return vocals, no_vocals
 
 
+# --- Параметры пайплайна из env (см. config/.env.example) ---
 MIN_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MIN_PRIMARY_SEC", "40"))
 MAX_PRIMARY_SEC = float(os.environ.get("SPEECHLAB_MAX_PRIMARY_SEC", "90"))
 ORIGINAL_AUDIO_RATIO = float(os.environ.get("SPEECHLAB_ORIGINAL_AUDIO_RATIO", "0.3"))
@@ -126,6 +139,7 @@ SKIP_DEMUCS = os.environ.get("SPEECHLAB_SKIP_DEMUCS", "0").lower() in ("1", "tru
 STATE_FILE = "pipeline_state.json"
 
 
+# --- Каталог проекта и resume: перезапуск с места остановки при том же входном файле ---
 def _projects_root(projects_root: Path | str | None = None) -> Path:
     if projects_root:
         return Path(projects_root).resolve()
@@ -134,6 +148,7 @@ def _projects_root(projects_root: Path | str | None = None) -> Path:
 
 
 def _file_sha256(path: Path) -> str:
+    """Хеш входного видео для resume — если файл заменили, пересчитываем всё."""
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -175,7 +190,9 @@ def _resume_enabled(project_dir: Path, video_path: Path) -> bool:
     return True
 
 
-# --- первичная нарезка по паузам (40–90 с) ---
+# =============================================================================
+# Шаг 2 PRD: первичная нарезка vocals по паузам → сегменты 40–90 с (first_seg/)
+# =============================================================================
 def _dub_gain(percent=None):
     """Множитель громкости дубляжа из %."""
     p = DUB_VOLUME_PERCENT if percent is None else percent
@@ -185,6 +202,7 @@ def _dub_gain(percent=None):
 
 
 def _split_long_segment(start, end, max_len):
+    """Разбить слишком длинный кусок (> MAX_PRIMARY_SEC) на части."""
     segs: list[tuple[float, float]] = []
     s = start
     while end - s > max_len:
@@ -308,7 +326,11 @@ def split_primary_segments(
     return manifest
 
 
-# --- парсинг speech_*.txt / перевод / casting / TTS ---
+# =============================================================================
+# Шаги 3–6: ASR-артефакты, перевод LLM, casting (возраст/пол), TTS Qwen3
+# =============================================================================
+
+# --- Парсинг speech_N.txt: время, спикер, текст ---
 def _parse_speech_txt(path):
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) < 3:
@@ -335,6 +357,7 @@ def _list_speech_wav(audio_dir: Path) -> list[Path]:
     return sorted(files, key=lambda p: int(SPEECH_WAV.match(p.name).group(1)))
 
 
+# --- Флаги resume: какие этапы second_seg уже выполнены ---
 def _has_asr_outputs(second_seg_dir: Path) -> bool:
     text_dir = second_seg_dir / "output_text_segments"
     audio_dir = second_seg_dir / "output_audio_segments"
@@ -380,6 +403,7 @@ def _has_dub_outputs(second_seg_dir: Path) -> bool:
     return True
 
 
+# --- Шаг 5 PRD: wav2vec age/gender → casting.json (профиль голоса на реплику) ---
 def build_casting(second_seg_dir: Path, *, unload: bool = True) -> dict:
     """Признаки голоса → casting.json. По умолчанию один профиль на спикера (длиннейшая реплика)."""
     from tools import dubbing
@@ -446,6 +470,7 @@ def build_casting(second_seg_dir: Path, *, unload: bool = True) -> dict:
     return casting
 
 
+# --- Парсинг JSON batch-перевода от LLM (снятие markdown-обёртки ```) ---
 def _parse_batch_translations(raw):
     s = (raw or "").strip()
     if s.startswith("```"):
@@ -466,6 +491,7 @@ def _translate_one(
     source_lang: str,
     target_lang: str,
 ) -> str:
+    """Fallback: перевод одной реплики (prompt kind=2) с лимитом длины под слот."""
     orig = meta["text"]
     slot_sec = float(meta["end"]) - float(meta["start"])
     prom = prompt.get_prompt(
@@ -482,6 +508,7 @@ def _translate_one(
     return (llm.llm_response(prom, json_only=False) or "").strip()
 
 
+# --- Шаг 4 PRD: перевод реплик (batch, fallback по одной) → target_text/ ---
 def translate_segments(
     second_seg_dir: Path,
     source_lang: str,
@@ -512,6 +539,7 @@ def translate_segments(
             })
 
         by_id: dict[str, str] = {}
+        # Сначала batch (kind=3); при ошибке — _translate_one для каждой реплики в batch
         try:
             prom = prompt.get_prompt(
                 3,
@@ -558,6 +586,7 @@ def _load_casting(second_seg_dir: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# --- Шаг 6 PRD: Qwen3-TTS VoiceDesign/clone → final_audio/*_dub.wav ---
 def dub_segments(
     second_seg_dir: Path,
     target_lang: str,
@@ -565,14 +594,17 @@ def dub_segments(
     unload: bool = True,
     bank_ready: bool = False,
 ) -> Path:
+    """Озвучить каждую реплику из target_text/ → final_audio/*_dub.wav."""
     from tools import dubbing
-    from tools.dubbing import dub_from_profile, ensure_voice_bank, unload_model
+    from tools.dubbing import dub_from_profile, ensure_voice_bank, needs_qwen_bank, unload_model
 
     tts_lang = _tts_language(target_lang)
-    if not bank_ready:
+    if not bank_ready and needs_qwen_bank(tts_lang):
         print("  TTS: банк 8 голосов (Design → Base clone)…")
         ensure_voice_bank(tts_lang)
         bank_ready = True
+    elif not bank_ready and dubbing.silero_enabled(tts_lang):
+        print("  TTS: Silero (ru), Qwen bank пропущен")
 
     casting = _load_casting(second_seg_dir)
     seg_map = casting.get("segments", {})
@@ -584,6 +616,7 @@ def dub_segments(
         meta = _parse_speech_txt(txt)
         if not meta:
             continue
+        # casting.json: профиль голоса (пол/возраст) → voice_key в dubbing
         seg = seg_map.get(txt.name, {})
         profile = dubbing.apply_voice_override(seg.get("profile", {}))
 
@@ -607,7 +640,11 @@ def dub_segments(
     return final_dir
 
 
-# --- склейка реплик и финальный микс ---
+# =============================================================================
+# Шаги 7–9: склейка реплик, микс с музыкой, оригинал видео ~30%, mux MP4
+# =============================================================================
+
+# --- Суммирование WAV на таймлайне (overlay реплик разных спикеров) ---
 def _build_timeline(placements, min_total_dur):
     """Суммирование реплик на таймлайне (overlay без обрезки WAV)."""
     max_end = float(min_total_dur)
@@ -638,6 +675,7 @@ def _build_timeline(placements, min_total_dur):
     return out
 
 
+# --- Шаг 7: fit_audio ±10%, overlay по спикерам → primary_dir/restored.wav ---
 def restore_primary_segment(primary_dir: Path) -> Path:
     """Склейка final_audio: fit ±10%, overlay только у разных спикеров (PRD)."""
     from tools.fit_audio import schedule_placements
@@ -668,6 +706,7 @@ def restore_primary_segment(primary_dir: Path) -> Path:
                     ))
 
     if not slots:
+        # Нет озвученных реплик — вернуть исходный segment.wav без изменений
         data, _ = sf.read(seg_wav, dtype="float32")
         if data.ndim > 1:
             data = data.mean(axis=1)
@@ -676,6 +715,7 @@ def restore_primary_segment(primary_dir: Path) -> Path:
         return out_path
 
     placements = schedule_placements(slots)
+    # fit_audio ±10% + overlay разных спикеров → суммирование на таймлайне
     mixed = _build_timeline(placements, total_dur)
     out_path = primary_dir / "restored.wav"
     sf.write(out_path, mixed, SR)
@@ -683,6 +723,7 @@ def restore_primary_segment(primary_dir: Path) -> Path:
     return out_path
 
 
+# --- Шаг 8: склейка первичных restored + stem no_vocals → full_dub.wav ---
 def restore_full_vocals(
     project_dir: Path,
     manifest: list[dict],
@@ -730,7 +771,7 @@ def restore_full_vocals(
     else:
         music = music[:full_len]
 
-    mixed = vocals + music * 0.85  # duck music slightly under voice
+    mixed = vocals + music * 0.85  # фон demucs (no_vocals), приглушён под голос
     peak = np.max(np.abs(mixed)) or 1.0
     if peak > 1.0:
         mixed = mixed / peak * 0.98
@@ -741,6 +782,7 @@ def restore_full_vocals(
 
 
 def _resample_mono(data: np.ndarray, sr: int, target_sr: int = SR) -> np.ndarray:
+    """Приведение к mono 16 kHz для микса дубляжа с оригиналом."""
     if data.ndim > 1:
         data = data.mean(axis=1)
     if sr == target_sr:
@@ -758,6 +800,7 @@ def extract_original_audio_16k(video_path: Path, out_wav: Path) -> None:
     extract_audio_16k(video_path, out_wav)
 
 
+# --- Шаг 9a: дубляж + оригинальная дорожка видео (PRD: ~30% оригинала) ---
 def mix_dub_with_original(
     video_path: Path,
     dub_wav: Path,
@@ -769,6 +812,7 @@ def mix_dub_with_original(
     """Финальная дорожка = дубляж × (dub%) + оригинал видео × original_ratio."""
     ratio = ORIGINAL_AUDIO_RATIO if original_ratio is None else original_ratio
     dub_gain = _dub_gain(dub_volume_percent)
+    # Вход только аудио — микс с оригиналом не нужен
     if not _has_video_stream(video_path):
         import shutil
         shutil.copy2(dub_wav, out_wav)
@@ -792,6 +836,7 @@ def mix_dub_with_original(
         dub = dub[:n]
 
     mixed = dub * dub_gain + orig * ratio
+    # Anti-clipping на сумме (отдельной нормализации оригинала нет)
     peak = float(np.max(np.abs(mixed))) or 1.0
     if peak > 1.0:
         mixed = mixed / peak * 0.98
@@ -805,6 +850,7 @@ def mix_dub_with_original(
     return out_wav
 
 
+# --- Шаг 9b: ffmpeg mux — видео + финальная аудиодорожка → *_dubbed.mp4 ---
 def mux_video(video_path: Path, audio_path: Path, out_path: Path) -> Path:
     """Склейка видео+аудио. Если вход только аудио (.wav) — MP4 с чёрным кадром."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -835,6 +881,9 @@ def mux_video(video_path: Path, audio_path: Path, out_path: Path) -> Path:
     return out_path
 
 
+# =============================================================================
+# Точка входа: run() — настройка голоса, _run_pipeline() — 9 шагов PRD
+# =============================================================================
 def run(
     project_name: str,
     video_path: str | Path,
@@ -850,6 +899,10 @@ def run(
     voice_age: int | float | None = None,
     voice_design_temperature: float | None = None,
     voice_clone_samples: list[dict] | None = None,
+    silero_speaker: str | None = None,
+    silero_all_replicas: bool = False,
+    silero_age_groups: list[str] | None = None,
+    silero_voices: list[dict] | None = None,
     projects_root: str | Path | None = None,
 ) -> Path:
     """
@@ -863,6 +916,10 @@ def run(
     voice_design_temperature — температура VoiceDesign (0–1). None → DESIGN_TEMP.
     voice_clone_samples — аудио для клонирования: список dict с gender, path,
       age_groups (child|teenager|mature|elderly, опц.), ref_text (опц.).
+    silero_speaker — Silero v5_ru (только target ru): aidar, baya, eugene, kseniya, xenia.
+    silero_all_replicas — все реплики одним silero_speaker (в т.ч. противоположный пол).
+    silero_age_groups — возрастные группы для silero_speaker; остальные → Qwen.
+    silero_voices — расширенный список [{speaker, gender?, age_groups?}, ...].
     Без кастомных промптов/сэмплов — банк .speechlab_voice_bank по умолчанию.
     """
     video_path = Path(video_path).resolve()
@@ -875,6 +932,7 @@ def run(
 
     from tools import dubbing
 
+    # Кастомный банк голосов проекта (VoiceDesign / clone samples) vs дефолтный .speechlab_voice_bank
     use_project_bank = bool(
         (voice_design_template or "").strip()
         or voice_design_by_key
@@ -891,6 +949,34 @@ def run(
         design_temperature=voice_design_temperature,
     )
     dubbing.set_voice_clone_samples(voice_clone_samples)
+
+    silero_requested = bool(
+        (silero_speaker or "").strip()
+        or silero_voices
+    )
+    if silero_requested:
+        from tools import silero_tts
+        if not silero_tts.is_russian_target(target_language):
+            raise ValueError(
+                "Silero TTS доступен только при target_language=ru (russian)"
+            )
+        dubbing.set_silero_options(
+            speaker=silero_speaker,
+            all_replicas=bool(silero_all_replicas),
+            age_groups=silero_age_groups,
+            voices=silero_voices,
+        )
+        if silero_all_replicas and silero_speaker:
+            print(f"  TTS: Silero all_replicas → {silero_speaker.strip().lower()}")
+        elif silero_voices:
+            print(f"  TTS: Silero voices ({len(silero_voices)} слот(ов))")
+        elif silero_speaker:
+            ages = silero_age_groups or ["child", "teenager", "mature", "elderly"]
+            print(
+                f"  TTS: Silero {silero_speaker.strip().lower()} "
+                f"(пол спикера, age_groups={','.join(ages)})"
+            )
+
     if use_project_bank:
         print(f"  TTS: банк голоса проекта → {project_dir / 'voice_bank'}")
     if dubbing.uses_custom_clone():
@@ -927,6 +1013,7 @@ def _run_pipeline(
     dub_volume_percent=None,
     original_audio_ratio=None,
 ):
+    """Последовательное выполнение шагов 1–9 PRD с поддержкой SPEECHLAB_RESUME."""
     print("=== 1. Аудио 16 kHz + demucs ===")
     project_vocals = project_dir / "vocals.wav"
     stems_dir = project_dir / "demucs_stems"
@@ -948,6 +1035,7 @@ def _run_pipeline(
     first_seg_dir = project_dir / "first_seg"
     manifest = split_primary_segments(project_vocals, first_seg_dir)
 
+    # pipeline_state.json — хеш входного файла для resume
     resume_ok = _resume_enabled(project_dir, video_path)
     _save_pipeline_state(
         project_dir, video_path,
@@ -955,6 +1043,7 @@ def _run_pipeline(
         target_language=target_language,
     )
 
+    # Для каждого первичного сегмента: pyannote + WhisperX + LLM → output_*_segments
     print("=== 3. ASR (pyannote + WhisperX + LLM) ===")
     jobs: list[tuple[Path, Path]] = []
     replica_count = 0
@@ -1007,17 +1096,27 @@ def _run_pipeline(
         build_casting(second_seg, unload=False)
     unload_casting()
 
-    print("=== 6. Qwen3-TTS → final_audio ===")
-    from tools.dubbing import ensure_voice_bank, unload_model as unload_tts
+    print("=== 6. TTS → final_audio ===")
+    from tools import dubbing
+    from tools.dubbing import ensure_voice_bank, needs_qwen_bank, unload_model as unload_tts
 
     tts_lang = _tts_language(target_language)
-    print("  TTS: банк 8 голосов (Design → Base clone)…")
-    ensure_voice_bank(tts_lang)
+    if needs_qwen_bank(tts_lang):
+        print("  TTS: банк 8 голосов (Design → Base clone)…")
+        ensure_voice_bank(tts_lang)
+        bank_ready = True
+    elif dubbing.silero_enabled(tts_lang):
+        print("  TTS: Silero (ru), Qwen bank пропущен")
+        bank_ready = False
+    else:
+        print("  TTS: банк 8 голосов (Design → Base clone)…")
+        ensure_voice_bank(tts_lang)
+        bank_ready = True
     for primary_dir, second_seg in jobs:
         if resume_ok and _has_dub_outputs(second_seg):
             print(f"  TTS {primary_dir.name}: пропуск (resume)")
             continue
-        dub_segments(second_seg, target_language, unload=False, bank_ready=True)
+        dub_segments(second_seg, target_language, unload=False, bank_ready=bank_ready)
     unload_tts()
 
     print("=== 7. Склейка реплик ===")
@@ -1047,6 +1146,7 @@ def _run_pipeline(
 
 
 def main() -> None:
+    """CLI: python main.py project video.mp4 en ru"""
     if len(sys.argv) < 5:
         print(
             "Использование: python main.py <project_name> <video_path> "

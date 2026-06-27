@@ -1,4 +1,8 @@
-"""Gunicorn: gunicorn -w 1 -b 0.0.0.0:8443 --certfile=cert.pem --keyfile=key.pem wsgi:app"""
+"""Gunicorn entrypoint: gunicorn -c deploy/gunicorn.conf.py wsgi:app
+
+Загружает config/.env до импорта Flask-приложения.
+В production Gunicorn слушает 127.0.0.1:8080, снаружи — nginx + TLS.
+"""
 from pathlib import Path
 
 from dotenv import load_dotenv

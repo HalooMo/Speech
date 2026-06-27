@@ -1,4 +1,8 @@
-"""Очередь задач: JSON на диске + subprocess (переживает reload gunicorn)."""
+"""Очередь задач: JSON на диске + subprocess (переживает reload gunicorn).
+
+Одна активная задача (queued/running) на весь сервер — один GPU.
+Gunicorn только принимает HTTP; пайплайн — отдельный процесс run_job.py.
+"""
 from __future__ import annotations
 
 import json
@@ -20,7 +24,11 @@ _LOCK_NAME = ".store.lock"
 
 @contextmanager
 def _store_lock(lock_path: Path):
-    """Межпроцессная блокировка (gunicorn workers + subprocess)."""
+    """Межпроцессная блокировка (gunicorn workers + subprocess).
+
+    enqueue() атомарно проверяет «нет ли уже активной задачи» и создаёт job.
+    Без flock два параллельных POST /dub могли бы запустить два GPU-процесса.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
     try:
@@ -46,6 +54,7 @@ def _utc_now() -> str:
 
 
 def _pid_alive(pid: int | None) -> bool:
+    """Проверка, жив ли subprocess воркера (после crash/reload gunicorn)."""
     if not pid or pid <= 0:
         return False
     if os.name == "nt":
@@ -66,6 +75,7 @@ def _pid_alive(pid: int | None) -> bool:
 
 
 class JobStatus(str, Enum):
+    """Жизненный цикл задачи дубляжа (отдаётся клиенту в GET /jobs/<id>)."""
     queued = "queued"
     running = "running"
     done = "done"
@@ -74,6 +84,7 @@ class JobStatus(str, Enum):
 
 @dataclass
 class Job:
+    """Снимок задачи: входное видео, языки, опции голоса, pid воркера, результат."""
     id: str
     status: JobStatus
     project_name: str
@@ -90,6 +101,8 @@ class Job:
 
 
 class JobStore:
+    """Хранилище задач: каждая job — файл jobs/<id>.json на диске."""
+
     def __init__(self, jobs_dir: Path) -> None:
         self.jobs_dir = jobs_dir
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -104,6 +117,7 @@ class JobStore:
         self._merge_disk()
 
     def _merge_disk(self) -> None:
+        """Синхронизация памяти с диском; помечает running→error если pid мёртв."""
         for p in self.jobs_dir.glob("*.json"):
             if p.name.endswith(".result.json"):
                 continue
@@ -123,6 +137,7 @@ class JobStore:
                 continue
 
     def _persist(self, job: Job) -> None:
+        """Запись job на диск — Flask и subprocess читают один файл."""
         data = asdict(job)
         data["status"] = job.status.value
         self._job_path(job.id).write_text(
@@ -130,6 +145,7 @@ class JobStore:
         )
 
     def _has_active_locked(self) -> bool:
+        """Есть ли задача в queued или running (вызывается под flock)."""
         return any(
             j.status in (JobStatus.queued, JobStatus.running) for j in self._jobs.values()
         )
@@ -164,6 +180,7 @@ class JobStore:
                 return job
 
     def get(self, job_id: str) -> Job | None:
+        """Прочитать job; подтягивает изменения с диска (subprocess мог обновить)."""
         with self._lock:
             self._merge_disk()
             return self._jobs.get(job_id)
@@ -176,6 +193,7 @@ class JobStore:
         return jobs[:limit]
 
     def update(self, job_id: str, **fields) -> None:
+        """Обновить поля job (status, result_path, error, pid…) и сохранить JSON."""
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -187,11 +205,13 @@ class JobStore:
             self._persist(job)
 
     def to_dict(self, job: Job) -> dict:
+        """Сериализация для jsonify() в Flask routes."""
         d = asdict(job)
         d["status"] = job.status.value
         return d
 
     def active_job_id(self) -> str | None:
+        """ID текущей queued/running задачи — для /health и 503."""
         with self._lock:
             self._merge_disk()
             for j in sorted(self._jobs.values(), key=lambda x: x.created_at, reverse=True):
@@ -201,7 +221,11 @@ class JobStore:
 
 
 def start_job(job: Job, projects_root: Path, logs_dir: Path) -> subprocess.Popen:
-    """Запуск пайплайна в отдельном процессе (не daemon-thread)."""
+    """Запуск пайплайна в отдельном процессе (не daemon-thread).
+
+    Отдельный процесс: Gunicorn reload не убивает долгий GPU-job;
+    лог пишется в server/data/logs/job_<id>.log.
+    """
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"job_{job.id}.log"
     env = os.environ.copy()

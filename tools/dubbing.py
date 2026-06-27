@@ -1,4 +1,13 @@
-"""Qwen TTS: 8 эталонов (пол×возраст) → voice clone."""
+"""Qwen3-TTS: озвучка дубляжа (PRD шаг 6).
+
+Схема:
+  1) ensure_voice_bank — 8 эталонов (male/female × 4 возраста):
+     VoiceDesign ИЛИ клон из пользовательского сэмпла → .wav в voice_bank
+  2) Base model create_voice_clone_prompt — эмбеддинг голоса по эталону
+  3) dub_from_profile — синтез реплики по тексту + профилю из casting.json
+
+Кэш: .speechlab_voice_bank/ или voice_bank/ проекта при кастомных промптах/сэмплах.
+"""
 import gc
 import json
 import os
@@ -7,7 +16,9 @@ from pathlib import Path
 
 import numpy as np
 
-# --- модели и кэш ---
+# =============================================================================
+# Модели Qwen, кэш эталонов, ключи голосов (8 = 2 пола × 4 возраста)
+# =============================================================================
 MODEL_DESIGN = os.environ.get("SPEECHLAB_TTS_DESIGN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
 MODEL_BASE = os.environ.get("SPEECHLAB_TTS_BASE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 _env_cache = os.environ.get("SPEECHLAB_VOICE_CACHE", "")
@@ -29,7 +40,7 @@ AGE_HINT = {
     "elderly": "adult",
 }
 
-# промпты VoiceDesign (редактируйте здесь)
+# Тексты и шаблоны VoiceDesign по умолчанию (переопределяются через API / set_voice_prompts)
 REF_TEXT = {
     "Russian": "Знаешь, я сейчас скажу как есть — без занудства, просто по-человечески, как в жизни разговаривают.",
     "English": "Look, I'll just say it the way people actually talk — not stiff, not like a presenter, just natural.",
@@ -42,18 +53,24 @@ REF_TEXT_BY_KEY = {}
 DESIGN_BY_KEY = {}
 DESIGN_TEMP = 0.72
 
+# Ленивая загрузка моделей в VRAM (один экземпляр Design + Base на процесс)
 _design_inst = None
 _base_inst = None
+# clone-prompts: ключ "Russian/male_mature" → объект для generate_voice_clone
 _clone_prompts = {}
 
-# переопределения на один прогон run() (None → дефолты DESIGN_* / детекция по реплике)
+# Параметры текущего run() из main.run() / API (сбрасываются в clear_voice_prompts)
 _active = {
     "template": None, "by_key": None, "cache_root": None,
     "gender": None, "age": None, "design_temp": None,
     "clone_by_key": None,  # voice_key → {path, ref_text}
+    # Silero TTS (только ru): all_speaker — одна голова на все реплики; slots — по полу/возрасту
+    "silero_all_speaker": None,
+    "silero_slots": None,  # list[{speaker, gender, age_groups}]
 }
 
 
+# --- Маппинг возраста в годах → возрастная группа для voice_key ---
 def age_to_group(age):
     """Возраст (лет) → child | teenager | mature | elderly."""
     age = float(age)
@@ -67,6 +84,7 @@ def age_to_group(age):
 
 
 def _norm_gender(gender):
+    """male/female из API; иначе ValueError."""
     if not gender:
         return None
     g = str(gender).strip().lower()
@@ -77,6 +95,9 @@ def _norm_gender(gender):
     raise ValueError(f"voice_gender: ожидается male/female, получено {gender!r}")
 
 
+# =============================================================================
+# Настройка голоса на один прогон run() (вызывается из main.run / server API)
+# =============================================================================
 def set_voice_prompts(
     template=None,
     by_key=None,
@@ -101,7 +122,104 @@ def clear_voice_prompts():
         _active[k] = None
 
 
+def set_silero_options(
+    speaker=None,
+    *,
+    all_replicas=False,
+    age_groups=None,
+    voices: list[dict] | None = None,
+) -> None:
+    """Silero v5_ru: только для target_language ru.
+
+    speaker + all_replicas=True — все реплики одним спикером (любой пол в casting).
+    speaker без all_replicas — реплики с тем же полом, что у спикера; age_groups — фильтр.
+    voices — расширенный список [{speaker, gender?, age_groups?}, ...].
+    """
+    from tools import silero_tts
+
+    _active["silero_all_speaker"] = None
+    _active["silero_slots"] = None
+
+    if voices:
+        slots: list[dict] = []
+        for i, item in enumerate(voices):
+            if not isinstance(item, dict):
+                raise ValueError(f"silero_voices[{i}]: ожидается объект")
+            spk = silero_tts.normalize_speaker(item.get("speaker") or "")
+            g = _norm_gender(item.get("gender")) or silero_tts.speaker_gender(spk)
+            ages = _norm_age_groups(item.get("age_groups"))
+            slots.append({"speaker": spk, "gender": g, "age_groups": ages})
+        _active["silero_slots"] = slots
+        return
+
+    if not speaker:
+        return
+    spk = silero_tts.normalize_speaker(speaker)
+    if all_replicas:
+        _active["silero_all_speaker"] = spk
+        return
+    ages = _norm_age_groups(age_groups)
+    _active["silero_slots"] = [{
+        "speaker": spk,
+        "gender": silero_tts.speaker_gender(spk),
+        "age_groups": ages,
+    }]
+
+
+def silero_enabled(language: str) -> bool:
+    """Заданы ли опции Silero и язык — русский."""
+    from tools import silero_tts
+    if not silero_tts.is_russian_target(language):
+        return False
+    return bool(_active.get("silero_all_speaker") or _active.get("silero_slots"))
+
+
+def needs_qwen_bank(language: str) -> bool:
+    """Нужен ли банк Qwen (если все реплики через Silero — нет)."""
+    from tools import silero_tts
+    if not silero_tts.is_russian_target(language):
+        return True
+    if _active.get("silero_all_speaker"):
+        return False
+    return True
+
+
+def _profile_gender(profile: dict) -> str:
+    """Пол реплики для сопоставления со спикером Silero."""
+    gender = (profile.get("gender") or "male").strip().lower()
+    if gender == "child":
+        probs = profile.get("gender_probs") or {}
+        gender = "female" if probs.get("female", 0) > probs.get("male", 0) else "male"
+    if gender not in ("male", "female"):
+        gender = "male"
+    return gender
+
+
+def resolve_silero_speaker(profile: dict, language: str) -> str | None:
+    """Имя спикера Silero или None → озвучка через Qwen."""
+    from tools import silero_tts
+    if not silero_tts.is_russian_target(language):
+        return None
+    if _active.get("silero_all_speaker"):
+        return _active["silero_all_speaker"]
+    slots = _active.get("silero_slots") or []
+    if not slots:
+        return None
+    gender = _profile_gender(profile)
+    age = (profile.get("age_group") or "mature").strip().lower()
+    if age not in AGE_GROUPS:
+        age = "mature"
+    for slot in slots:
+        if slot["gender"] != gender:
+            continue
+        if age not in slot["age_groups"]:
+            continue
+        return slot["speaker"]
+    return None
+
+
 def _norm_age_groups(age_groups) -> list[str]:
+    """Пусто → все 4 группы; иначе подмножество child|teenager|mature|elderly."""
     if not age_groups:
         return list(AGE_GROUPS)
     out: list[str] = []
@@ -114,6 +232,7 @@ def _norm_age_groups(age_groups) -> list[str]:
     return out
 
 
+# --- Пользовательские аудио-сэмплы: один WAV/MP3 → несколько voice_key по age_groups ---
 def set_voice_clone_samples(samples: list[dict] | None) -> None:
     """Аудио-сэмплы для клонирования: пол + возрастные группы → voice_key.
 
@@ -139,6 +258,7 @@ def set_voice_clone_samples(samples: list[dict] | None) -> None:
     _active["clone_by_key"] = expanded or None
 
 
+# --- Флаги: есть ли кастомизация голоса в текущем прогоне ---
 def uses_custom_voice():
     """Есть ли кастомные промпты/стиль в текущем прогоне."""
     return bool(
@@ -161,6 +281,7 @@ def has_voice_profile_override():
     return bool(_active["gender"] or _active["age"] is not None)
 
 
+# --- Подстановка voice_gender/voice_age из API поверх детекции по WAV (casting) ---
 def apply_voice_override(profile):
     """Подставить voice_gender / voice_age из run() в профиль casting."""
     p = dict(profile or {})
@@ -178,6 +299,7 @@ def _design_temp():
 
 
 def _bank_root():
+    """Корень voice_bank: глобальный кэш или папка проекта."""
     return _active["cache_root"] if _active["cache_root"] else CACHE_ROOT
 
 
@@ -186,6 +308,7 @@ def _settings_meta_path():
 
 
 def _clone_samples_meta() -> dict:
+    """Снимок путей/mtime сэмплов — для инвалидации банка при смене файла."""
     if not _active["clone_by_key"]:
         return {}
     meta = {}
@@ -200,6 +323,7 @@ def _clone_samples_meta() -> dict:
 
 
 def _current_settings_meta():
+    """Текущие промпты/температура/сэмплы — сравнивается с voice_settings.json."""
     return {
         "prompts": {
             "template": _active["template"],
@@ -225,6 +349,7 @@ def _settings_changed():
 
 
 def _save_settings_meta():
+    """Записать voice_settings.json после пересборки банка."""
     if not has_custom_voice_bank():
         return
     _bank_root().mkdir(parents=True, exist_ok=True)
@@ -233,6 +358,9 @@ def _save_settings_meta():
     )
 
 
+# =============================================================================
+# Тексты для VoiceDesign и выбор voice_key из casting profile
+# =============================================================================
 def map_lang(language):
     """Код языка → имя для Qwen."""
     return MAP_LANG.get((language or "").strip().lower(), language)
@@ -260,6 +388,7 @@ def design_instruct(lang, gender, age, voice_key):
 
 
 def normalize_voice_key(profile):
+    """casting profile → ключ male_mature и т.п. для выбора эталона из банка."""
     """casting profile → ключ male_mature и т.п."""
     gender = (profile.get("gender") or "male").strip().lower()
     age = (profile.get("age_group") or "mature").strip().lower()
@@ -274,14 +403,19 @@ def normalize_voice_key(profile):
 
 
 def _cache_dir(lang):
+    """Подкаталог банка по языку: .speechlab_voice_bank/russian/…"""
     return _bank_root() / lang.lower().replace(" ", "_")
 
 
 def _clone_spec(voice_key: str) -> dict | None:
+    """Спека пользовательского clone-сэмпла для voice_key или None."""
     by_key = _active["clone_by_key"]
     return by_key.get(voice_key) if by_key else None
 
 
+# =============================================================================
+# Подготовка эталонных WAV и загрузка Qwen3-TTS
+# =============================================================================
 def _prepare_ref_wav(src: Path, dst: Path) -> None:
     """mp3/wav → mono WAV для Qwen clone (ffmpeg)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -319,7 +453,7 @@ def _install_clone_sample(spec: dict, wav_path: Path, lang: str, voice_key: str)
 
 
 def _patch_talker():
-    """Фикс pad_token_id в Qwen3."""
+    """Фикс pad_token_id в Qwen3 (иначе generate падает на некоторых конфигах)."""
     from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSTalkerConfig
     if getattr(Qwen3TTSTalkerConfig, "_speechlab_patched", False):
         return
@@ -335,7 +469,7 @@ def _patch_talker():
 
 
 def _load_qwen(model_id):
-    """Загрузить Qwen3TTSModel."""
+    """Загрузить Qwen3TTSModel на cuda:0 или CPU."""
     import torch
     from qwen_tts import Qwen3TTSModel
     _patch_talker()
@@ -345,6 +479,7 @@ def _load_qwen(model_id):
 
 
 def _design_model():
+    """Синглтон VoiceDesign (создаёт эталонные WAV)."""
     global _design_inst
     if _design_inst is None:
         print("  TTS: VoiceDesign…")
@@ -353,6 +488,7 @@ def _design_model():
 
 
 def _base_model():
+    """Синглтон Base (clone prompt + синтез реплик)."""
     global _base_inst
     if _base_inst is None:
         print("  TTS: Base clone…")
@@ -361,6 +497,7 @@ def _base_model():
 
 
 def _free_design():
+    """Выгрузить VoiceDesign из VRAM после генерации эталонов."""
     global _design_inst
     import torch
     _design_inst = None
@@ -369,6 +506,9 @@ def _free_design():
         torch.cuda.empty_cache()
 
 
+# =============================================================================
+# Сборка voice_bank: 8 эталонов + create_voice_clone_prompt для каждого
+# =============================================================================
 def ensure_voice_bank(language, force=False):
     """Создать 8 эталонов .wav + clone-prompts в кэше."""
     global _clone_prompts
@@ -376,6 +516,7 @@ def ensure_voice_bank(language, force=False):
     cache = _cache_dir(lang)
     cache.mkdir(parents=True, exist_ok=True)
 
+    # Смена промптов/сэмплов → пересоздать банк
     if has_custom_voice_bank() and _settings_changed():
         force = True
 
@@ -383,6 +524,7 @@ def ensure_voice_bank(language, force=False):
     if need:
         import soundfile as sf
         clone_keys = set(_active["clone_by_key"] or {})
+        # Ключи без пользовательского сэмпла — генерируем через VoiceDesign
         design_keys = [vk for vk in VOICE_KEYS if vk not in clone_keys]
         if clone_keys:
             print(f"  TTS: clone samples ({lang})…")
@@ -427,6 +569,7 @@ def ensure_voice_bank(language, force=False):
 
     if force:
         _clone_prompts.clear()
+    # Base model: из каждого .wav строим voice_clone_prompt (кэш в памяти)
     print(f"  TTS: clone-prompts ({lang})…")
     base = _base_model()
     for vk in VOICE_KEYS:
@@ -438,6 +581,7 @@ def ensure_voice_bank(language, force=False):
         if not wav_path.is_file():
             raise FileNotFoundError(wav_path)
         spec = _clone_spec(vk)
+        # ref_text обязателен для качества; без него — x_vector_only_mode (хуже, но работает)
         if spec and spec.get("ref_text"):
             line = spec["ref_text"]
             x_vector = False
@@ -454,6 +598,9 @@ def ensure_voice_bank(language, force=False):
         )
 
 
+# =============================================================================
+# Синтез одной реплики (вызывается из main.dub_segments)
+# =============================================================================
 def dub_tts(text, language, gender, age, out_path):
     """Озвучить одну реплику по полу/возрасту."""
     return dub_from_profile(
@@ -462,17 +609,25 @@ def dub_tts(text, language, gender, age, out_path):
 
 
 def dub_from_profile(text, language, profile, out_path, *, bank_ready=False):
-    """Озвучка по dict из casting.json. bank_ready=True если ensure_voice_bank уже вызван."""
+    """Озвучка по casting.json: Silero (ru) или Qwen3-TTS."""
     if not (text or "").strip():
         raise ValueError("text пустой")
     profile = apply_voice_override(profile or {})
     lang = map_lang(language)
+
+    silero_spk = resolve_silero_speaker(profile, lang)
+    if silero_spk:
+        from tools import silero_tts
+        silero_tts.synthesize(text, silero_spk, out_path)
+        return str(Path(out_path).resolve())
+
     vk = normalize_voice_key(profile)
     if not bank_ready:
         ensure_voice_bank(lang)
     key = f"{lang}/{vk}"
     prompt = _clone_prompts.get(key)
     if prompt is None:
+        # Банк мог обновиться — пересобрать prompts
         ensure_voice_bank(lang, force=True)
         prompt = _clone_prompts[key]
     import soundfile as sf
@@ -488,11 +643,13 @@ def dub_from_profile(text, language, profile, out_path, *, bank_ready=False):
 
 
 def unload_model():
-    """Освободить VRAM."""
+    """Освободить VRAM после этапа TTS (Qwen + Silero)."""
     global _design_inst, _base_inst, _clone_prompts
     import torch
+    from tools import silero_tts
     _design_inst = _base_inst = None
     _clone_prompts = {}
+    silero_tts.unload_model()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

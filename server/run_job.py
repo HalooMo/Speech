@@ -1,4 +1,8 @@
-"""Воркер: python -m server.run_job <job_id>"""
+"""Воркер GPU-пайплайна: python -m server.run_job <job_id>
+
+Запускается как subprocess из routes.create_dub() / jobs.start_job().
+Обновляет jobs/<id>.json: running → done | error.
+"""
 from __future__ import annotations
 
 import os
@@ -30,12 +34,14 @@ def main() -> int:
         print(f"job not found: {job_id}", file=sys.stderr)
         return 1
 
+    # Помечаем задачу running; pid нужен JobStore для детекта «зомби» после crash
     store.update(job_id, status=JobStatus.running, started_at=_utc_now(), pid=os.getpid())
 
     try:
         import main as pipeline
 
         opts = job.options
+        # Полный пайплайн PRD: demucs → ASR → LLM → TTS → mux MP4
         out = pipeline.run(
             job.project_name,
             job.video_path,
@@ -50,6 +56,10 @@ def main() -> int:
             voice_age=opts.get("voice_age"),
             voice_design_temperature=opts.get("voice_design_temperature"),
             voice_clone_samples=opts.get("voice_clone_samples"),
+            silero_speaker=opts.get("silero_speaker"),
+            silero_all_replicas=bool(opts.get("silero_all_replicas")),
+            silero_age_groups=opts.get("silero_age_groups"),
+            silero_voices=opts.get("silero_voices"),
         )
         store.update(
             job_id,
@@ -61,6 +71,7 @@ def main() -> int:
         print(f"OK: {out}")
         return 0
     except Exception as exc:
+        # traceback обрезается — JSON job не раздувается
         store.update(
             job_id,
             status=JobStatus.error,

@@ -1,4 +1,12 @@
-"""ASR: pyannote + WhisperX → LLM → output_audio/text_segments."""
+"""ASR-модуль пайплайна (PRD шаг 3.1–3.2).
+
+Имя test.py историческое: модуль используется из main.py на каждом первичном
+сегменте; отдельно запускается как `python test.py` для отладки одного WAV.
+
+Цепочка на один segment.wav (~40–90 с):
+  pyannote (кто говорит) → WhisperX (слова + таймкоды) →
+  LLM kind=1 (финальные реплики) → speech_*.wav + speech_*.txt
+"""
 import ast
 import gc
 import json
@@ -20,6 +28,8 @@ from config.env_config import get_hf_token
 from tools import llm
 
 ROOT = Path(__file__).resolve().parent
+
+# --- Настройки для локального `python test.py` (не используются из main) ---
 WAV_PATH = ROOT / "vocals.wav"
 SOURCE_LANG = "en"
 OUTPUT_AUDIO_DIR = ROOT / "output_audio_segments"
@@ -30,12 +40,12 @@ COMPUTE_TYPE = os.environ.get("SPEECHLAB_COMPUTE_TYPE", "float32")
 WHISPER_MODEL = os.environ.get("SPEECHLAB_WHISPER_MODEL", "large-v3")
 MAX_WORDS = int(os.environ.get("SPEECHLAB_MAX_WORDS_LLM", "2800"))
 
-# кэш ASR-моделей между первичными сегментами
+# Синглтон ASR: main вызывает init один раз, затем run_segment_pipeline × N сегментов
 _asr = {"lang": None, "diarization": None, "whisper": None, "align_model": None, "align_meta": None}
 
 
 def clear_dir(path):
-    """Очистить папку выходов."""
+    """Очистить папку перед повторной нарезкой (не при resume)."""
     path.mkdir(parents=True, exist_ok=True)
     for item in path.iterdir():
         if item.is_file() or item.is_symlink():
@@ -45,7 +55,7 @@ def clear_dir(path):
 
 
 def parse_llm_segments(raw):
-    """JSON-массив сегментов из ответа LLM."""
+    """Разбор JSON-массива реплик из ответа LLM (снятие ```json, отказы)."""
     s = (raw or "").strip()
     if not s:
         raise ValueError("LLM: пустой ответ")
@@ -67,7 +77,7 @@ def parse_llm_segments(raw):
 
 
 def cut_audio(audio, sr, start, end):
-    """Вырезать кусок numpy-audio по секундам."""
+    """Вырезать фрагмент numpy-массива по секундам [start, end)."""
     n = len(audio) if audio.ndim == 1 else audio.shape[0]
     if end <= start:
         return audio[:0]
@@ -76,8 +86,11 @@ def cut_audio(audio, sr, start, end):
     return audio[a:b]
 
 
+# =============================================================================
+# Загрузка / выгрузка ASR-моделей (один раз на все первичные сегменты)
+# =============================================================================
 def init_asr_models(source_language, hf_token=None):
-    """Загрузить pyannote + WhisperX (один раз на язык)."""
+    """pyannote + Whisper + align-модель. Пропуск, если язык уже загружен."""
     token = hf_token or get_hf_token()
     lang = source_language.strip().lower()
     if _asr["lang"] == lang and _asr["whisper"] is not None:
@@ -99,16 +112,19 @@ def init_asr_models(source_language, hf_token=None):
 
 
 def unload_asr_models():
-    """Сброс VRAM после ASR."""
+    """Освободить VRAM перед casting/TTS (main вызывает после цикла сегментов)."""
     _asr.update(lang=None, diarization=None, whisper=None, align_model=None, align_meta=None)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
+# =============================================================================
+# Один первичный segment.wav → output_audio/text_segments
+# =============================================================================
 def run_segment_pipeline(audio_path, output_audio_dir, output_text_dir, source_language,
                          hf_token=None, clear_outputs=True, reuse_asr=True):
-    """Один segment.wav → diarization → WhisperX → LLM → speech_*.wav/txt."""
+    """Полный ASR+LLM цикл для одного куска vocals (first_seg/.../segment.wav)."""
     token = hf_token or get_hf_token()
     audio_path = Path(audio_path)
     out_a, out_t = Path(output_audio_dir), Path(output_text_dir)
@@ -125,6 +141,7 @@ def run_segment_pipeline(audio_path, output_audio_dir, output_text_dir, source_l
         unload_asr_models()
         init_asr_models(source_language, token)
 
+    # mono 16 kHz — формат пайплайна
     wave, sr = torchaudio.load(str(audio_path))
     if wave.shape[0] > 1:
         wave = wave.mean(dim=0, keepdim=True)
@@ -132,21 +149,25 @@ def run_segment_pipeline(audio_path, output_audio_dir, output_text_dir, source_l
         wave = torchaudio.functional.resample(wave, sr, 16000)
         sr = 16000
     audio = wave.squeeze(0).numpy()
-    diar = _asr["diarization"]({"waveform": wave, "sample_rate": sr})
 
+    # 1) Diarization: интервалы спикеров SPEAKER_00, SPEAKER_01, …
+    diar = _asr["diarization"]({"waveform": wave, "sample_rate": sr})
     rows = []
     for seg, spk in diar.speaker_diarization.itertracks():
         rows.append({"start": max(0, seg.start), "end": min(wave.shape[1] / sr, seg.end), "speaker": spk})
     rows.sort(key=lambda x: x["start"])
     diarize_df = pd.DataFrame(rows)
 
+    # 2) WhisperX: текст + word-level timestamps
     tr = _asr["whisper"].transcribe(audio, batch_size=4)
     tr = whisperx.align(tr["segments"], _asr["align_model"], _asr["align_meta"], audio, DEVICE, return_char_alignments=False)
+    # 3) Привязка каждого слова к спикеру из pyannote
     words = whisperx.assign_word_speakers(diarize_df, tr)["word_segments"]
 
     if len(words) > MAX_WORDS:
         raise ValueError(f"Слишком много слов ({len(words)} > {MAX_WORDS})")
 
+    # 4) LLM улучшает границы реплик и текст (prompt kind=1)
     raw = llm.llm_response_retry(prompt.get_prompt(1, words), json_only=True, retries=3)
     segments = [
         s for s in parse_llm_segments(raw)
@@ -155,6 +176,7 @@ def run_segment_pipeline(audio_path, output_audio_dir, output_text_dir, source_l
     ]
     segments.sort(key=lambda s: float(s["start"]))
 
+    # 5) Нарезка WAV и запись speech_NNN.txt (время, спикер, текст)
     n = 0
     for seg in segments:
         chunk = cut_audio(audio, 16000, float(seg["start"]), float(seg["end"]))
@@ -169,7 +191,7 @@ def run_segment_pipeline(audio_path, output_audio_dir, output_text_dir, source_l
 
 
 def run_test():
-    """python test.py — локальный прогон vocals.wav."""
+    """Локальная отладка: python test.py на WAV_PATH без полного main.py."""
     if not WAV_PATH.is_file():
         raise FileNotFoundError(WAV_PATH)
     try:

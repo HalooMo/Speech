@@ -1,4 +1,7 @@
-"""Локальный запуск: python -m server"""
+"""Локальный запуск API без Gunicorn: python -m server
+
+Для разработки. В production — gunicorn + nginx (deploy/speechlab.service).
+"""
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,6 +22,7 @@ def main() -> None:
     print(f"SpeechLab API [{cfg.env}] → {scheme}://{cfg.host}:{cfg.port}")
     if cfg.env != "production" and not ssl:
         print("  (prod: SPEECHLAB_ENV=production + nginx TLS)")
+    # threaded=True — несколько HTTP-запросов параллельно (статус jobs), GPU — один subprocess
     app.run(host=cfg.host, port=cfg.port, ssl_context=ssl, threaded=True)
 
 

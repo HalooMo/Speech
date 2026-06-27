@@ -1,4 +1,8 @@
-"""Секреты из config/.env."""
+"""Секреты и параметры LLM/HF из config/.env.
+
+Загружается при импорте; main.py и server/run_job.py дополнительно
+вызывают load_dotenv для override из config/.env.
+"""
 import os
 from pathlib import Path
 
@@ -10,6 +14,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 
 def get_hf_token():
+    """Hugging Face — pyannote, Qwen TTS и др."""
     t = os.environ.get("HF_TOKEN", "").strip()
     if not t:
         raise ValueError("HF_TOKEN не задан в config/.env")
@@ -17,6 +22,7 @@ def get_hf_token():
 
 
 def get_openai_api_key():
+    """OpenAI-compatible API — сегментация и перевод через LLM."""
     k = os.environ.get("OPENAI_API_KEY", "").strip()
     if not k:
         raise ValueError("OPENAI_API_KEY не задан в config/.env")

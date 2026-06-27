@@ -1,4 +1,11 @@
-"""Пол/возраст по WAV → dict для casting.json."""
+"""Определение пола и возраста по WAV реплики → профиль для casting.json (PRD 3.4).
+
+Используется в main.build_casting() перед TTS: по профилю выбирается
+voice_key (male_mature и т.д.) в tools/dubbing.py.
+
+Эмоция (Dpngtm/wav2vec2) опциональна — по умолчанию SPEECHLAB_SKIP_EMOTION=1,
+т.к. Qwen TTS в текущем пайплайне эмоцию из casting не использует.
+"""
 import gc
 import os
 
@@ -13,6 +20,7 @@ EMOTION_MODEL = os.environ.get("SPEECHLAB_EMOTION_MODEL", "Dpngtm/wav2vec2-emoti
 AGE_MODEL = os.environ.get("SPEECHLAB_AGE_GENDER_MODEL", "audeering/wav2vec2-large-robust-24-ft-age-gender")
 SKIP_EMOTION = os.environ.get("SPEECHLAB_SKIP_EMOTION", "1").lower() not in ("0", "false", "no")
 
+# Ленивая загрузка — модели держим в памяти до unload_model()
 _emotion = {"fe": None, "model": None}
 _age = {"proc": None, "model": None, "dev": None}
 
@@ -22,7 +30,7 @@ def _dev():
 
 
 def load_audio_16k(path):
-    """WAV → mono float32 16kHz."""
+    """Привести любой WAV к mono float32 16 kHz (вход wav2vec)."""
     wav, sr = torchaudio.load(str(path))
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
@@ -32,6 +40,7 @@ def load_audio_16k(path):
 
 
 def _age_group(age):
+    """Возраст в годах → группа для voice_key (как в dubbing.age_to_group)."""
     if age < 13:
         return "child"
     if age < 20:
@@ -41,7 +50,9 @@ def _age_group(age):
     return "elderly"
 
 
-# Архитектура как в README audeering/wav2vec2-large-robust-24-ft-age-gender
+# =============================================================================
+# Модель audeering: wav2vec2 + две головы (возраст регрессия, пол 3-class)
+# =============================================================================
 class _Head(nn.Module):
     def __init__(self, config, n):
         super().__init__()
@@ -58,6 +69,8 @@ class _Head(nn.Module):
 
 
 class _AgeGender(Wav2Vec2PreTrainedModel):
+    """Кастомная архитектура как в README модели audeering на Hugging Face."""
+
     def __init__(self, config):
         super().__init__(config)
         self.wav2vec2 = Wav2Vec2Model(config)
@@ -86,6 +99,7 @@ def _load_age():
 
 
 def _predict_age_gender(audio):
+    """Inference: gender (female/male/child), age в годах, age_group."""
     _load_age()
     x = _age["proc"](audio, sampling_rate=16000, return_tensors="pt")["input_values"].to(_age["dev"])
     with torch.no_grad():
@@ -115,7 +129,7 @@ def _predict_emotion(audio):
 
 
 def profile_from_wav(audio_path, *, with_emotion=None):
-    """Профиль реплики для casting.json. Эмоция не используется в TTS — по умолчанию выкл."""
+    """Главная функция: путь к speech_*.wav → dict для casting.json['profile']."""
     use_emo = (not SKIP_EMOTION) if with_emotion is None else with_emotion
     audio = load_audio_16k(audio_path)
     ag = _predict_age_gender(audio)
@@ -136,7 +150,7 @@ def profile_from_wav(audio_path, *, with_emotion=None):
 
 
 def unload_model():
-    """VRAM перед TTS."""
+    """Выгрузить wav2vec из VRAM перед Qwen TTS (main вызывает после casting)."""
     global _emotion, _age
     _emotion = {"fe": None, "model": None}
     _age = {"proc": None, "model": None, "dev": None}

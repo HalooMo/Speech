@@ -1,4 +1,8 @@
-"""OpenAI-compatible LLM (промпты в prompt.py)."""
+"""OpenAI-compatible LLM (промпты в prompt.py).
+
+Используется для: сегментации реплик, перевода (одиночного и batch).
+Ключи и base_url — из config/.env (OPENAI_*).
+"""
 import time
 
 import prompt
@@ -8,7 +12,7 @@ _client = None
 
 
 def _openai():
-    """Ленивый клиент OpenAI."""
+    """Ленивый клиент OpenAI — один экземпляр на процесс."""
     global _client
     if _client is None:
         from openai import OpenAI
@@ -17,7 +21,7 @@ def _openai():
 
 
 def llm_response(user_prompt, json_only=False, batch_translate=False):
-    """Один запрос к LLM."""
+    """Один запрос к LLM; temperature ниже для JSON (сегментация)."""
     system = prompt.get_system(json_only=json_only, batch_translate=batch_translate)
     temp = 0.2 if json_only else 0.4
     r = _openai().chat.completions.create(
@@ -29,7 +33,7 @@ def llm_response(user_prompt, json_only=False, batch_translate=False):
 
 
 def looks_like_refusal(text, json_only=False):
-    """Отказ LLM или пустой ответ."""
+    """Детект отказа LLM или пустого ответа — триггер для retry."""
     s = (text or "").strip().lower()
     if not s:
         return True
@@ -42,7 +46,7 @@ def looks_like_refusal(text, json_only=False):
 
 
 def llm_response_retry(user_prompt, json_only=False, batch_translate=False, retries=3, retry_suffix=""):
-    """Повтор при отказе или пустом ответе."""
+    """Повтор при отказе или пустом ответе; к prompt добавляется retry_suffix."""
     suffix = retry_suffix or prompt.get_retry_suffix(json_only=json_only, batch_translate=batch_translate)
     last = ""
     for i in range(retries):

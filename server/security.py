@@ -1,10 +1,15 @@
-"""Проверки путей и доступа для продакшена."""
+"""Проверки путей и доступа для продакшена.
+
+Клиент передаёт video_path / sample_path — сервер не должен читать файлы
+вне upload_dir и projects_root (защита от ../../../etc/passwd).
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
 
 def _is_under(path: Path, root: Path) -> bool:
+    """path.resolve() внутри root.resolve()? (защита от .. в video_path)."""
     try:
         path.resolve().relative_to(root.resolve())
         return True

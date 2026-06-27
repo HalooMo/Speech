@@ -1,7 +1,7 @@
 # SpeechLab — деплой на облачный сервер
 
 Пошаговое руководство по развёртыванию HTTP API дубляжа на Linux-сервере с GPU.
-Пример из продакшена: домен `vandum.ru`, сервер с Ubuntu, путь `/opt/speechlab`.
+Пример из продакшена: API на `app.app.vandum.ru`, сервер с Ubuntu, путь `/opt/speechlab`.
 
 Архитектура:
 
@@ -188,12 +188,11 @@ curl -s -H "X-API-Key: ВАШ_КЛЮЧ" http://127.0.0.1:8080/api/v1/jobs
 
 ## 7. Nginx + HTTPS (Let's Encrypt)
 
-Подставить свой домен вместо `vandum.ru`:
+Подставить свой домен вместо `app.vandum.ru`:
 
 ```bash
 cp /opt/speechlab/deploy/nginx.conf.example /etc/nginx/sites-available/speechlab
-nano /etc/nginx/sites-available/speechlab
-# заменить dub.example.com → vandum.ru (все вхождения)
+# при другом домене — заменить app.vandum.ru в server_name и путях ssl_certificate
 ln -sf /etc/nginx/sites-available/speechlab /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
@@ -202,7 +201,7 @@ nginx -t
 Получить сертификат:
 
 ```bash
-certbot --nginx -d vandum.ru
+certbot --nginx -d app.vandum.ru
 systemctl reload nginx
 ```
 
@@ -212,11 +211,64 @@ systemctl reload nginx
 - `proxy_set_header X-API-Key $http_x_api_key;` — проброс API-ключа
 - `proxy_set_header Authorization $http_authorization;`
 
-Проверка снаружи:
+---
+
+## 7.1. Перенос API на поддомен `app.vandum.ru`
+
+Если API раньше был на `vandum.ru`, а нужен поддомен:
+
+**1. DNS** (панель регистратора, TTL 300–600):
+
+| Тип | Имя | Значение |
+|-----|-----|----------|
+| A | `app` | IP сервера (тот же, что у `vandum.ru`) |
+
+Проверка (с любой машины):
 
 ```bash
-curl -s https://vandum.ru/health
+dig +short app.vandum.ru
 ```
+
+**2. Nginx на сервере:**
+
+```bash
+nano /etc/nginx/sites-available/speechlab
+```
+
+Заменить `server_name vandum.ru` → `server_name app.vandum.ru` (в блоках `:443` и `:80`).
+
+**3. Сертификат для поддомена:**
+
+```bash
+nginx -t
+certbot --nginx -d app.vandum.ru
+systemctl reload nginx
+```
+
+**4. Редирект со старого URL (опционально):**
+
+В тот же файл или отдельный `sites-available/vandum-redirect`:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name vandum.ru www.vandum.ru;
+    ssl_certificate     /etc/letsencrypt/live/vandum.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vandum.ru/privkey.pem;
+    return 301 https://app.vandum.ru$request_uri;
+}
+```
+
+**5. Проверка:**
+
+```bash
+curl -s https://app.vandum.ru/health
+curl -s -H "X-API-Key: КЛЮЧ" https://app.vandum.ru/api/v1/jobs
+```
+
+Gunicorn и `config/.env` менять не нужно — API слушает `127.0.0.1:8080`, меняется только nginx/DNS.
+
+**6. Клиенты** — заменить базовый URL на `https://app.vandum.ru` (см. `for_client.txt`).
 
 ---
 
@@ -225,7 +277,7 @@ curl -s https://vandum.ru/health
 С локальной машины (Windows CMD):
 
 ```cmd
-curl.exe -X POST "https://vandum.ru/api/v1/dub" ^
+curl.exe -X POST "https://app.vandum.ru/api/v1/dub" ^
   -H "X-API-Key: ВАШ_КЛЮЧ" ^
   -F "project_name=demo" ^
   -F "source_language=en" ^
@@ -236,7 +288,7 @@ curl.exe -X POST "https://vandum.ru/api/v1/dub" ^
 Ответ `202` с полем `"id"`. Опрос статуса:
 
 ```cmd
-curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" https://vandum.ru/api/v1/jobs/JOB_ID
+curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" https://app.vandum.ru/api/v1/jobs/JOB_ID
 ```
 
 Скачивание готового MP4:
@@ -244,7 +296,7 @@ curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" https://vandum.ru/api/v1/jobs/JOB_ID
 ```cmd
 curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" ^
   -o "C:\Users\Имя\Downloads\demo_dubbed.mp4" ^
-  "https://vandum.ru/api/v1/jobs/JOB_ID/download"
+  "https://app.vandum.ru/api/v1/jobs/JOB_ID/download"
 ```
 
 Подробнее для клиентов — файл `for_client.txt` в корне репозитория.

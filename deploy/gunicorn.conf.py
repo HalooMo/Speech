@@ -1,4 +1,8 @@
-"""Gunicorn: gunicorn -c deploy/gunicorn.conf.py wsgi:app"""
+"""Gunicorn: gunicorn -c deploy/gunicorn.conf.py wsgi:app
+
+workers=1 — один GPU-пайплайн одновременно.
+timeout=0 — HTTP только ставит job в очередь; долгая работа в subprocess.
+"""
 import os
 from pathlib import Path
 

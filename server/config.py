@@ -1,4 +1,8 @@
-"""Настройки HTTP(S)-сервера из env."""
+"""Настройки HTTP(S)-сервера из env.
+
+Все пути и флаги читаются при создании ServerConfig — после load_dotenv в wsgi.py
+или из EnvironmentFile systemd (config/.env).
+"""
 import os
 import sys
 from pathlib import Path
@@ -6,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# --- Парсеры env-переменных ---
 def _int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -19,9 +24,10 @@ def _bool(name: str, default: bool = False) -> bool:
 
 
 class ServerConfig:
-    """Читает env при создании экземпляра (после load_dotenv / systemd)."""
+    """Единый объект настроек API: ключи, пути, лимиты upload, SSL."""
 
     def __init__(self) -> None:
+        # Сеть, авторизация, каталоги данных (jobs, uploads, projects, logs)
         self.env = os.environ.get("SPEECHLAB_ENV", "development").strip().lower()
         self.api_key = os.environ.get("SPEECHLAB_API_KEY", "").strip()
         self.host = os.environ.get("SPEECHLAB_SERVER_HOST", "0.0.0.0")
@@ -47,6 +53,7 @@ class ServerConfig:
 
     @property
     def video_roots(self) -> list[Path]:
+        # Разрешённые корни для video_path и voice samples (защита от path traversal)
         return [self.upload_dir.resolve(), self.projects_root.resolve()]
 
     def ensure_dirs(self) -> None:
@@ -54,7 +61,7 @@ class ServerConfig:
             d.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> None:
-        """Жёсткие проверки перед продакшеном."""
+        """В production API key обязателен — иначе процесс завершается при старте."""
         if self.env == "production":
             if not self.api_key:
                 print("FATAL: SPEECHLAB_API_KEY обязателен при SPEECHLAB_ENV=production", file=sys.stderr)
