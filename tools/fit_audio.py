@@ -48,6 +48,53 @@ def read_duration(wav_path):
     return info.frames / info.samplerate
 
 
+def _rms(y: np.ndarray) -> float:
+    """RMS громкости mono float32 (тишина → 0)."""
+    if y.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(y, dtype=np.float64))))
+
+
+def match_loudness(dub_wav, original_wav, *, max_gain=8.0, min_rms=1e-4):
+    """Подогнать громкость дубляжа под оригинальную реплику (RMS).
+
+    Зачем: TTS часто тише/громче исходной речи → на фоне demucs-шума
+    дубляж «тонет» или наоборот орёт. Делаем сразу после TTS на паре
+    final_audio/*_dub.wav ↔ output_audio_segments/speech_*.wav.
+
+    max_gain — потолок усиления (линейный множитель), чтобы не раздувать шум
+    на почти тихих оригиналах. После gain — peak ≤ 0.98 (anti-clip).
+    Перезаписывает dub_wav на месте. Возвращает применённый gain.
+    """
+    dub_path = Path(dub_wav)
+    orig_path = Path(original_wav)
+    if not dub_path.is_file() or not orig_path.is_file():
+        return 1.0
+
+    dub, sr_d = sf.read(dub_path, dtype="float32")
+    orig, _ = sf.read(orig_path, dtype="float32")
+    if dub.ndim > 1:
+        dub = dub.mean(axis=1)
+    if orig.ndim > 1:
+        orig = orig.mean(axis=1)
+
+    rms_d, rms_o = _rms(dub), _rms(orig)
+    # Оригинал или дубль почти тихие — не трогаем (иначе gain → ∞)
+    if rms_d < min_rms or rms_o < min_rms:
+        return 1.0
+
+    gain = float(np.clip(rms_o / rms_d, 1.0 / max_gain, max_gain))
+    if abs(gain - 1.0) < 0.02:
+        return 1.0
+
+    out = dub * gain
+    peak = float(np.max(np.abs(out))) or 1.0
+    if peak > 1.0:
+        out = out / peak * 0.98
+    sf.write(dub_path, out.astype(np.float32), sr_d)
+    return gain
+
+
 # =============================================================================
 # Подгонка одной реплики под слот [start, end] с ограничением ±max_stretch
 # =============================================================================

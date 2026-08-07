@@ -258,26 +258,22 @@ def set_voice_clone_samples(samples: list[dict] | None) -> None:
     _active["clone_by_key"] = expanded or None
 
 
-# --- Флаги: есть ли кастомизация голоса в текущем прогоне ---
-def uses_custom_voice():
-    """Есть ли кастомные промпты/стиль в текущем прогоне."""
-    return bool(
-        _active["template"] or _active["by_key"] or _active["design_temp"] is not None,
-    )
+# --- Флаги кастомизации голоса в текущем run() ---
+def has_custom_voice_bank() -> bool:
+    """Нужен ли отдельный voice_bank проекта (промпты и/или clone-сэмплы)."""
+    a = _active
+    return bool(a["template"] or a["by_key"] or a["design_temp"] is not None or a["clone_by_key"])
 
 
-def uses_custom_clone():
-    """Есть ли пользовательские аудио-сэмплы для клонирования."""
+def uses_custom_voice() -> bool:
+    return bool(_active["template"] or _active["by_key"] or _active["design_temp"] is not None)
+
+
+def uses_custom_clone() -> bool:
     return bool(_active["clone_by_key"])
 
 
-def has_custom_voice_bank():
-    """Нужен ли отдельный voice_bank проекта (промпты и/или сэмплы)."""
-    return uses_custom_voice() or uses_custom_clone()
-
-
-def has_voice_profile_override():
-    """Заданы ли пол/возраст для всех реплик."""
+def has_voice_profile_override() -> bool:
     return bool(_active["gender"] or _active["age"] is not None)
 
 
@@ -388,8 +384,7 @@ def design_instruct(lang, gender, age, voice_key):
 
 
 def normalize_voice_key(profile):
-    """casting profile → ключ male_mature и т.п. для выбора эталона из банка."""
-    """casting profile → ключ male_mature и т.п."""
+    """casting profile → male_mature и т.п. для выбора эталона из банка."""
     gender = (profile.get("gender") or "male").strip().lower()
     age = (profile.get("age_group") or "mature").strip().lower()
     if gender == "child":
