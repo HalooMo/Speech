@@ -56,10 +56,8 @@ def main() -> int:
             voice_age=opts.get("voice_age"),
             voice_design_temperature=opts.get("voice_design_temperature"),
             voice_clone_samples=opts.get("voice_clone_samples"),
-            silero_speaker=opts.get("silero_speaker"),
-            silero_all_replicas=bool(opts.get("silero_all_replicas")),
-            silero_age_groups=opts.get("silero_age_groups"),
-            silero_voices=opts.get("silero_voices"),
+            cast_voice=opts.get("cast_voice"),
+            cast_mode=opts.get("cast_mode"),
         )
         store.update(
             job_id,

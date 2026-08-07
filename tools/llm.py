@@ -2,6 +2,8 @@
 
 Используется для: сегментации реплик, перевода (одиночного и batch).
 Ключи и base_url — из config/.env (OPENAI_*).
+
+Retry: отказ/пустой ответ + сетевые/5xx/timeout (с backoff).
 """
 import time
 
@@ -18,6 +20,35 @@ def _openai():
         from openai import OpenAI
         _client = OpenAI(base_url=get_openai_base_url(), api_key=get_openai_api_key())
     return _client
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Сетевые сбои, таймаут, 429/5xx — имеет смысл повторить."""
+    try:
+        from openai import (
+            APIConnectionError,
+            APITimeoutError,
+            InternalServerError,
+            RateLimitError,
+            APIStatusError,
+        )
+    except ImportError:
+        APIConnectionError = APITimeoutError = InternalServerError = RateLimitError = ()
+        APIStatusError = None
+
+    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)):
+        return True
+    if APIStatusError is not None and isinstance(exc, APIStatusError):
+        code = getattr(exc, "status_code", None) or 0
+        return code == 429 or code >= 500
+    # fallback без типов openai (старые SDK / обёртки)
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if any(k in name for k in ("timeout", "connection", "ratelimit")):
+        return True
+    if any(k in msg for k in ("timeout", "connection", "temporarily", "429", "502", "503", "504")):
+        return True
+    return False
 
 
 def llm_response(user_prompt, json_only=False, batch_translate=False):
@@ -46,14 +77,24 @@ def looks_like_refusal(text, json_only=False):
 
 
 def llm_response_retry(user_prompt, json_only=False, batch_translate=False, retries=3, retry_suffix=""):
-    """Повтор при отказе или пустом ответе; к prompt добавляется retry_suffix."""
+    """Повтор при отказе/пустом ответе и при сетевых ошибках (backoff 1.5^n с)."""
     suffix = retry_suffix or prompt.get_retry_suffix(json_only=json_only, batch_translate=batch_translate)
     last = ""
+    last_exc = None
     for i in range(retries):
         body = f"{user_prompt}\n\n{suffix}" if i and suffix else user_prompt
-        last = llm_response(body, json_only=json_only, batch_translate=batch_translate)
-        if last and not looks_like_refusal(last, json_only=json_only):
-            return last
+        try:
+            last = llm_response(body, json_only=json_only, batch_translate=batch_translate)
+            last_exc = None
+            if last and not looks_like_refusal(last, json_only=json_only):
+                return last
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_error(exc):
+                raise
+            print(f"  LLM сеть/сервер ({type(exc).__name__}): попытка {i + 1}/{retries}")
         if i + 1 < retries:
-            time.sleep(1.5)
+            time.sleep(1.5 * (1.5 ** i))
+    if last_exc is not None:
+        raise last_exc
     return last

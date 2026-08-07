@@ -2,6 +2,7 @@
 
 Эндпоинты:
   GET  /health              — проверка сервиса
+  GET  /api/v1/cast-voices  — встроенные голоса data/Cast
   POST /api/v1/dub          — создать задачу (multipart video или JSON video_path)
   GET  /api/v1/jobs         — список задач
   GET  /api/v1/jobs/<id>    — статус
@@ -16,7 +17,7 @@ from pathlib import Path
 from flask import Blueprint, current_app, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
-from server.jobs import JobStatus, start_job
+from server.jobs import JobStatus, start_job, _utc_now
 from server.security import allowed_result_path, allowed_video_path
 
 bp = Blueprint("api", __name__)
@@ -50,22 +51,6 @@ def _opt_float(key: str):
     if v is None or v == "":
         return None
     return float(v)
-
-
-def _opt_bool(key: str) -> bool | None:
-    v = request.form.get(key)
-    if v is None:
-        v = _json_body().get(key)
-    if v is None or v == "":
-        return None
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "on"):
-        return True
-    if s in ("0", "false", "no", "off"):
-        return False
-    raise ValueError(f"{key}: ожидается true/false, получено {v!r}")
 
 
 def _opt_str(key: str):
@@ -274,81 +259,6 @@ def _parse_voice_clone_samples(cfg, project_name: str) -> list[dict] | None:
     return samples or None
 
 
-# --- Silero TTS (только target_language ru) ---
-def _validate_silero_voices(raw: list) -> list[dict]:
-    """Проверка silero_voices: speaker, gender?, age_groups?."""
-    from tools import silero_tts
-
-    out: list[dict] = []
-    errors: list[str] = []
-    for i, item in enumerate(raw):
-        if not isinstance(item, dict):
-            errors.append(f"silero_voices[{i}]: ожидается объект")
-            continue
-        try:
-            spk = silero_tts.normalize_speaker(item.get("speaker") or "")
-        except ValueError as exc:
-            errors.append(f"silero_voices[{i}]: {exc}")
-            continue
-        gender = item.get("gender")
-        if gender is not None:
-            try:
-                gender = _norm_clone_gender(gender)
-            except ValueError as exc:
-                errors.append(f"silero_voices[{i}]: {exc}")
-                continue
-        try:
-            ages = _parse_age_groups(item.get("age_groups"))
-        except ValueError as exc:
-            errors.append(f"silero_voices[{i}]: {exc}")
-            continue
-        entry: dict = {"speaker": spk}
-        if gender:
-            entry["gender"] = gender
-        if ages is not None:
-            entry["age_groups"] = ages
-        out.append(entry)
-    if errors:
-        raise ValueError("; ".join(errors))
-    return out
-
-
-def _parse_silero_voices() -> list[dict] | None:
-    raw = _json_body().get("silero_voices")
-    if isinstance(raw, list) and raw:
-        return _validate_silero_voices(raw)
-    form_raw = request.form.get("silero_voices")
-    if form_raw:
-        try:
-            parsed = json.loads(form_raw)
-        except json.JSONDecodeError:
-            raise ValueError("silero_voices: невалидный JSON") from None
-        if isinstance(parsed, list) and parsed:
-            return _validate_silero_voices(parsed)
-    return None
-
-
-def _parse_silero_options() -> dict:
-    """Silero v5_ru: speaker, all_replicas, age_groups, silero_voices."""
-    opts: dict = {}
-    speaker = _opt_str_any("silero_speaker", "silero_voice")
-    if speaker:
-        opts["silero_speaker"] = speaker
-    all_rep = _opt_bool("silero_all_replicas")
-    if all_rep is not None:
-        opts["silero_all_replicas"] = all_rep
-    raw_ages = request.form.get("silero_age_groups")
-    if raw_ages is None:
-        raw_ages = _json_body().get("silero_age_groups")
-    ages = _parse_age_groups(raw_ages)
-    if ages is not None:
-        opts["silero_age_groups"] = ages
-    voices = _parse_silero_voices()
-    if voices:
-        opts["silero_voices"] = voices
-    return opts
-
-
 # --- Опции дубляжа: громкость, VoiceDesign, температура ---
 def _parse_options() -> dict:
     """Опции дубляжа: голос, громкость, промпт VoiceDesign."""
@@ -377,11 +287,20 @@ def _merge_options(project_name: str) -> dict:
     clone_samples = _parse_voice_clone_samples(_cfg(), project_name)
     if clone_samples:
         opts["voice_clone_samples"] = clone_samples
-    try:
-        silero = _parse_silero_options()
-    except ValueError:
-        raise
-    opts.update(silero)
+    cast_voice = _opt_str_any("cast_voice", "voice_cast")
+    cast_mode = _opt_str_any("cast_mode")
+    if cast_voice:
+        # Проверка id/имени на этапе API (файл data/Cast должен существовать)
+        from tools.cast_voices import resolve_cast_voice
+        resolve_cast_voice(cast_voice)
+        opts["cast_voice"] = cast_voice
+    if cast_mode:
+        mode = cast_mode.strip().lower()
+        if mode not in ("speakers",):
+            raise ValueError(f"cast_mode: ожидается speakers, получено {cast_mode!r}")
+        opts["cast_mode"] = mode
+    if cast_voice and cast_mode:
+        raise ValueError("Укажите либо cast_voice, либо cast_mode — не оба сразу")
     return opts
 
 
@@ -396,6 +315,14 @@ def health():
         "env": cfg.env,
         "active_job": store.active_job_id(),
     })
+
+
+# --- GET /api/v1/cast-voices — встроенные пресеты Qwen clone (data/Cast) ---
+@bp.get("/api/v1/cast-voices")
+def cast_voices():
+    """Список встроенных голосов (нужен API-ключ, как у остальных /api/*)."""
+    from tools.cast_voices import list_cast_voices
+    return jsonify({"voices": list_cast_voices()})
 
 
 # --- POST /api/v1/dub — создание задачи и запуск subprocess ---
@@ -418,11 +345,9 @@ def create_dub():
       voice_sample_male_ref_text / voice_sample_female_ref_text — транскрипт сэмпла
       voice_clone_samples — JSON-массив (расширенный формат)
 
-    Silero TTS (только target_language ru):
-      silero_speaker — aidar | baya | eugene | kseniya | xenia
-      silero_all_replicas — true: все реплики одним спикером
-      silero_age_groups — child,teenager,mature,elderly (пусто = все)
-      silero_voices — JSON [{speaker, gender?, age_groups?}, ...]
+    Встроенные cast-голоса (data/Cast, Qwen Base clone):
+      cast_voice — id или имя: loki|tom_hardy|thor | Локи|Том Харди|Тор
+      cast_mode=speakers — раздать все 3 голоса по спикерам (по кругу)
     """
     cfg = _cfg()
     store = _store()
@@ -439,6 +364,9 @@ def create_dub():
             return jsonify({
                 "error": "Нужны project_name, source_language, target_language, video_path",
             }), 400
+        # Валидация имени ДО любых записей на диск (path traversal)
+        if not _PROJECT_RE.match(project_name):
+            return jsonify({"error": "project_name: только буквы, цифры, _ и - (до 64)"}), 400
         video_path = Path(video_raw).resolve()
         try:
             options = _merge_options(project_name)
@@ -450,6 +378,8 @@ def create_dub():
         target_lang = (request.form.get("target_language") or request.form.get("target_lang") or "").strip()
         if not all([project_name, source_lang, target_lang]):
             return jsonify({"error": "Нужны project_name, source_language, target_language"}), 400
+        if not _PROJECT_RE.match(project_name):
+            return jsonify({"error": "project_name: только буквы, цифры, _ и - (до 64)"}), 400
         if "video" not in request.files:
             return jsonify({"error": "Загрузите файл video (multipart) или передайте video_path в JSON"}), 400
         f = request.files["video"]
@@ -467,9 +397,6 @@ def create_dub():
             video_path.unlink(missing_ok=True)
             return jsonify({"error": str(exc)}), 400
 
-    # Валидация имени проекта и пути к видео (security.allowed_video_path)
-    if not _PROJECT_RE.match(project_name):
-        return jsonify({"error": "project_name: только буквы, цифры, _ и - (до 64)"}), 400
     if not allowed_video_path(video_path, cfg.video_roots):
         return jsonify({"error": "video_path вне разрешённых каталогов upload/projects"}), 403
 
@@ -481,7 +408,17 @@ def create_dub():
             "active_job_id": store.active_job_id(),
         }), 503
 
-    proc = start_job(job, cfg.projects_root, cfg.logs_dir)
+    try:
+        proc = start_job(job, cfg.projects_root, cfg.logs_dir)
+    except Exception as exc:
+        # Иначе job остаётся queued навсегда и блокирует GPU-очередь
+        store.update(
+            job.id,
+            status=JobStatus.error,
+            finished_at=_utc_now(),
+            error=f"start_job failed: {exc}",
+        )
+        return jsonify({"error": f"Не удалось запустить воркер: {exc}"}), 500
     store.update(job.id, pid=proc.pid)
     return jsonify(store.to_dict(store.get(job.id))), 202
 

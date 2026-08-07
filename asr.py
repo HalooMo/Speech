@@ -138,9 +138,15 @@ def run_segment_pipeline(
     audio = wave.squeeze(0).numpy()
 
     diar = _asr["diarization"]({"waveform": wave, "sample_rate": sr})
+    # yield_label=True обязателен: иначе второй элемент — track id (_), не SPEAKER_XX
+    ann = getattr(diar, "speaker_diarization", diar)
     rows = [
-        {"start": max(0, seg.start), "end": min(wave.shape[1] / sr, seg.end), "speaker": spk}
-        for seg, spk in diar.speaker_diarization.itertracks()
+        {
+            "start": max(0.0, float(seg.start)),
+            "end": min(wave.shape[1] / sr, float(seg.end)),
+            "speaker": str(spk),
+        }
+        for seg, _, spk in ann.itertracks(yield_label=True)
     ]
     rows.sort(key=lambda x: x["start"])
     diarize_df = pd.DataFrame(rows)
@@ -156,13 +162,30 @@ def run_segment_pipeline(
         raise ValueError(f"Слишком много слов ({len(words)} > {MAX_WORDS})")
 
     raw = llm.llm_response_retry(prompt.get_prompt(1, words), json_only=True, retries=3)
-    segments = [
-        s for s in parse_llm_segments(raw)
-        if s.get("type") == "speech" and (s.get("text") or "").strip()
-        and float(s["end"]) > float(s["start"])
-    ]
-    segments.sort(key=lambda s: float(s["start"]))
+    segments = []
+    for s in parse_llm_segments(raw):
+        if s.get("type") != "speech" or not (s.get("text") or "").strip():
+            continue
+        try:
+            start, end = float(s["start"]), float(s["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        spk = str(s.get("speaker") or "SPEAKER_00").strip() or "SPEAKER_00"
+        segments.append({"start": start, "end": end, "speaker": spk, "text": s["text"].strip()})
+    segments.sort(key=lambda s: s["start"])
 
+    # При пересчёте ASR сбрасываем downstream, иначе сиротские speech_*.txt уходят в TTS
+    if clear_outputs:
+        second_root = out_a.parent
+        for name in ("target_text", "final_audio"):
+            clear_dir(second_root / name)
+        casting = second_root / "casting.json"
+        if casting.is_file():
+            casting.unlink()
+
+    written = []
     n = 0
     for seg in segments:
         chunk = cut_audio(audio, 16000, float(seg["start"]), float(seg["end"]))
@@ -177,7 +200,8 @@ def run_segment_pipeline(
             f"{seg['start']:.2f} - {seg['end']:.2f}\n{seg['speaker']}\n{seg['text']}",
             encoding="utf-8",
         )
-    return segments
+        written.append(seg)
+    return written
 
 
 def run_test():

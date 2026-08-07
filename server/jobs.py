@@ -117,7 +117,7 @@ class JobStore:
         self._merge_disk()
 
     def _merge_disk(self) -> None:
-        """Синхронизация памяти с диском; помечает running→error если pid мёртв."""
+        """Синхронизация памяти с диском; stale queued/running → error если pid мёртв."""
         for p in self.jobs_dir.glob("*.json"):
             if p.name.endswith(".result.json"):
                 continue
@@ -125,7 +125,12 @@ class JobStore:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 data["status"] = JobStatus(data["status"])
                 job = Job(**data)
-                if job.status == JobStatus.running and not _pid_alive(job.pid):
+                stale = (
+                    job.status in (JobStatus.running, JobStatus.queued)
+                    and job.pid is not None
+                    and not _pid_alive(job.pid)
+                )
+                if stale:
                     job.status = JobStatus.error
                     job.error = (job.error or "") + "\nworker process died"
                     job.finished_at = job.finished_at or _utc_now()

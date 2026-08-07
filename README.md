@@ -133,6 +133,7 @@ gunicorn -c deploy/gunicorn.conf.py wsgi:app
 | Endpoint | Описание |
 |----------|----------|
 | `GET /health` | Статус сервиса |
+| `GET /api/v1/cast-voices` | Встроенные голоса (Локи / Том Харди / Тор) |
 | `POST /api/v1/dub` | Запуск (multipart `video` или JSON `video_path`) |
 | `GET /api/v1/jobs/<id>` | Статус задачи |
 | `GET /api/v1/jobs/<id>/download` | Скачать `{project}_dubbed.mp4` |
@@ -155,8 +156,10 @@ gunicorn -c deploy/gunicorn.conf.py wsgi:app
 | `voice_sample_*_ages` | `child,teenager,mature,elderly` или JSON-массив; пусто = все 4 |
 | `voice_sample_*_ref_text` | Точная транскрипт сэмпла (улучшает качество клона) |
 | `voice_clone_samples` | JSON-массив расширенного формата (см. `for_client.txt`) |
+| `cast_voice` | Встроенный пресет: `loki` / `tom_hardy` / `thor` (или «Локи» / «Том Харди» / «Тор») |
+| `cast_mode` | `speakers` — раздать все 3 cast-голоса по спикерам |
 
-Слоты без сэмпла озвучиваются через VoiceDesign; с сэмплом — клонирование по референсу.
+Список пресетов: `GET /api/v1/cast-voices`. Слоты без сэмпла озвучиваются через VoiceDesign; с сэмплом — клонирование по референсу.
 
 ```bash
 curl -X POST https://dub.example.com/api/v1/dub \
@@ -208,27 +211,10 @@ Speech/
 ├── server/              # Flask API + subprocess worker
 ├── deploy/              # gunicorn, nginx, systemd
 ├── wsgi.py
-├── kaggle/
-│   ├── kaggle_one_cell.py
-│   └── README.md
 ├── PRD.md               # требования (источник истины)
 └── .cursor/rules/
     └── main-rules.mdc
 ```
-
----
-
-## Kaggle
-
-Полный прогон в одной ячейке: скопируйте [`kaggle/kaggle_one_cell.py`](kaggle/kaggle_one_cell.py) в GPU-ноутбук.
-
-Подробности: [`kaggle/README.md`](kaggle/README.md)
-
-- Dataset с кодом + видео
-- Secrets: `HF_TOKEN`, `OPENAI_API_KEY`
-- В ячейке оставьте плейсхолдеры `hf_...` / `sk-...` или задайте ключи только в Secrets
-
-Зависимости для ноутбука: `requirements-kaggle.txt`
 
 ---
 

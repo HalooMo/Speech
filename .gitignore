@@ -10,10 +10,6 @@ __pycache__/
 
 .speechlab_voice_bank/
 
-# Kaggle: ячейка с секретами + локальный пакет для датасета
-my_files/
-kaggle/kaggle_one_cell.py
-
 server/uploads/
 server/data/
 server/ssl/*.pem

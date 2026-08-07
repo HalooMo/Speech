@@ -138,20 +138,6 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
     "voice_age": 40
   }'
 
---- 4.6. JSON — Silero TTS (только target_language ru) ---
-
-curl -X POST "https://app.vandum.ru/api/v1/dub" \
-  -H "X-API-Key: ВАШ_КЛЮЧ" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "project_name": "demo",
-    "source_language": "en",
-    "target_language": "ru",
-    "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
-    "silero_speaker": "eugene",
-    "silero_all_replicas": true
-  }'
-
 Ответ при успехе: HTTP 202 Accepted
 
 Пример:
@@ -184,7 +170,7 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
 
 Передаются в той же форме (multipart) или в JSON-теле POST /api/v1/dub.
 
-Голос (Qwen3-TTS VoiceDesign — по умолчанию для всех языков):
+Голос (Qwen3-TTS VoiceDesign — для всех языков):
   voice_prompt              — текст промпта для дизайна голоса
   voice_design_template     — то же, что voice_prompt
   voice_design_prompt       — то же, что voice_prompt
@@ -192,20 +178,6 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
   voice_age                 — возраст в годах, число (напр. 32)
   voice_design_temperature  — 0..1, «креативность» TTS (по умолчанию ~0.72)
   voice_design_by_key       — JSON: промпт отдельно для типа голоса
-
-Голос (Silero TTS v5_ru — только target_language = ru):
-  silero_speaker            — aidar | baya | eugene | kseniya | xenia
-  silero_all_replicas       — true | false (по умолчанию false)
-  silero_age_groups         — child,teenager,mature,elderly (опционально)
-  silero_voices             — JSON-массив слотов (расширенный формат)
-
-  Спикеры Silero:
-    aidar, eugene   — мужской голос
-    baya, kseniya, xenia — женский голос
-
-  Silero работает ТОЛЬКО при target_language = ru (или russian).
-  Для других языков дубляжа параметры silero_* игнорируются (ошибка 400 при
-  явной передаче silero_speaker / silero_voices с target_language ≠ ru).
 
 Плейсхолдеры в voice_prompt:
   {lang}         — язык дубляжа (Russian, English, …)
@@ -321,113 +293,74 @@ JSON (файлы уже на сервере):
   - Слоты с сэмплом: референс конвертируется в WAV и клонируется через Qwen3-TTS
   - Слоты без сэмпла: голос создаётся моделью VoiceDesign (промпт или дефолт)
   - Озвучка реплик: Qwen3-TTS Base clone по профилю casting (пол + возраст)
-  - Если задан Silero (см. п. 5.2) — часть или все реплики озвучиваются Silero,
-    остальные — Qwen по той же схеме
+  - После TTS громкость каждой реплики подгоняется под исходный speech_*.wav
+    (чтобы дубляж не тонул и не перекрикивал оригинал)
 
 
---- 5.2. Silero TTS — готовые русские голоса (опционально) ---
+--- 5.2. Встроенные cast-голоса (data/Cast, Qwen 1.7 Base clone) ---
 
-Альтернатива Qwen3-TTS для русского дубляжа: фиксированные спикеры модели
-Silero v5_ru (быстрее, меньше нагрузка на GPU, не нужен банк VoiceDesign).
+На сервере лежат 3 готовых эталона для клонирования. Их не нужно загружать
+файлом — достаточно указать id или русское имя.
 
-Доступные спикеры:
-  aidar    — мужской
-  eugene   — мужской
-  baya     — женский
-  kseniya  — женский
-  xenia    — женский
+  id            имя         файл
+  ------------  ----------  ----------------
+  loki          Локи        AlexGav.wav
+  tom_hardy     Том Харди   IlyaIsaev.wav
+  thor          Тор         IvanZhark.wav
 
-Условие: target_language должен быть ru (или russian). Иначе запрос с silero_*
-вернёт ошибку 400.
+Список с путями и эталонными текстами:
+  GET /api/v1/cast-voices
+  (нужен X-API-Key)
 
-Режимы:
+  curl.exe -H "X-API-Key: ВАШ_КЛЮЧ" ^
+    "https://app.vandum.ru/api/v1/cast-voices"
 
-  1) По полу спикера (по умолчанию)
-     silero_speaker=eugene
-     silero_all_replicas=false (или не передавать)
-     → мужские реплики озвучивает Eugene, женские — Qwen (VoiceDesign/clone)
+Два режима (взаимоисключающие — не указывайте оба сразу):
 
-  2) Один спикер на все реплики
-     silero_speaker=eugene
-     silero_all_replicas=true
-     → все реплики (включая женские) озвучивает Eugene; Qwen не загружается
+  A) cast_voice — ОДИН голос на весь дубляж (все мужские слоты = этот клон;
+     voice_gender подставляется из пресета, если не задан явно).
 
-  3) Фильтр по возрастной группе
-     silero_speaker=aidar
-     silero_age_groups=mature,elderly
-     → только реплики mature/elderly мужского пола через Silero; остальные — Qwen
-     Если silero_age_groups не указан — все 4 группы (child, teenager, mature, elderly)
+  B) cast_mode=speakers — все 3 голоса раздаются спикерам по кругу
+     (SPEAKER_00→Локи, SPEAKER_01→Том Харди, SPEAKER_02→Тор, …).
 
-  4) Несколько слотов (JSON silero_voices)
-     Разные спикеры для разных комбинаций пол × возраст.
-
-Поля API:
-  silero_speaker       — имя спикера (см. список выше)
-  silero_all_replicas  — true | 1 | yes — озвучить ВСЕ реплики этим спикером
-  silero_age_groups    — child,teenager,mature,elderly или JSON-массив
-  silero_voices        — JSON-массив объектов:
-                         {"speaker": "eugene", "gender": "male",
-                          "age_groups": ["mature", "elderly"]}
-
-Пол и возраст реплики берутся из автоматического casting (как для Qwen).
-silero_all_replicas=true — casting по полу для выбора спикера не применяется.
-
-Пример — мужской Silero, женские реплики через Qwen (Windows CMD):
+Пример A — весь ролик голосом «Локи» (Windows CMD):
 
   curl.exe -X POST "https://app.vandum.ru/api/v1/dub" ^
     -H "X-API-Key: ВАШ_КЛЮЧ" ^
     -F "project_name=demo" ^
     -F "source_language=en" ^
     -F "target_language=ru" ^
-    -F "silero_speaker=eugene" ^
+    -F "cast_voice=loki" ^
     -F "video=@C:\Users\Имя\Videos\diolog.mp4"
 
-Пример — все реплики одним голосом (PowerShell):
+То же по имени: -F "cast_voice=Локи"  (также: tom_hardy / «Том Харди», thor / «Тор»)
+
+Пример B — многоголосый cast по спикерам (PowerShell):
 
   curl.exe -X POST "https://app.vandum.ru/api/v1/dub" `
     -H "X-API-Key: ВАШ_КЛЮЧ" `
     -F "project_name=demo" `
     -F "source_language=en" `
     -F "target_language=ru" `
-    -F "silero_speaker=baya" `
-    -F "silero_all_replicas=true" `
+    -F "cast_mode=speakers" `
     -F "video=@$env:USERPROFILE\Videos\diolog.mp4"
 
-Пример — Silero только для взрослых мужчин, остальное Qwen:
+JSON:
 
-  curl.exe -X POST "https://app.vandum.ru/api/v1/dub" ^
-    -H "X-API-Key: ВАШ_КЛЮЧ" ^
-    -F "project_name=demo" ^
-    -F "source_language=en" ^
-    -F "target_language=ru" ^
-    -F "silero_speaker=aidar" ^
-    -F "silero_age_groups=mature,elderly" ^
-    -F "video=@C:\Users\Имя\Videos\diolog.mp4"
+  {
+    "project_name": "demo",
+    "source_language": "en",
+    "target_language": "ru",
+    "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
+    "cast_mode": "speakers"
+  }
 
-JSON — несколько слотов Silero + Qwen для остальных:
+или: "cast_voice": "thor"
 
-  curl -X POST "https://app.vandum.ru/api/v1/dub" \
-    -H "X-API-Key: ВАШ_КЛЮЧ" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "project_name": "demo",
-      "source_language": "en",
-      "target_language": "ru",
-      "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
-      "silero_voices": [
-        {"speaker": "eugene", "gender": "male", "age_groups": ["mature"]},
-        {"speaker": "kseniya", "gender": "female"}
-      ]
-    }'
-
-Комбинации:
-  - Silero + voice_prompt — Silero для выбранных реплик, Qwen с промптом для остальных
-  - Silero + voice_sample_* — Silero для части реплик, клон из сэмпла для других
-  - silero_all_replicas=true — только Silero, Qwen не используется (быстрее)
-
-На сервере (переменные окружения, опционально):
-  SPEECHLAB_SILERO_MODEL=v5_ru
-  SPEECHLAB_SILERO_SAMPLE_RATE=48000
+Можно комбинировать cast с VoiceDesign для слотов без сэмпла (например,
+cast_voice закрывает male_*, female остаётся на VoiceDesign + voice_prompt).
+Загрузка своих voice_sample_* по-прежнему доступна (раздел 5.1) и имеет
+приоритет на пересекающихся слотах, если передана вместе с cast.
 
 
 --------------------------------------------------------------------------------
@@ -569,24 +502,16 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
   API_KEY = "ВАШ_КЛЮЧ"
   HEADERS = {"X-API-Key": API_KEY}
 
-  # 1. Запуск (вариант A: Qwen VoiceDesign)
+  # 1. Запуск
   form = {
       "project_name": "demo",
       "source_language": "en",
       "target_language": "ru",
-      "voice_prompt": "Natural {gender_hint}, {lang}. {age_hint}.",
-      "voice_gender": "female",
-      "voice_age": "32",
+      "cast_mode": "speakers",  # или cast_voice="loki" / "Локи"
+      # "voice_prompt": "Natural {gender_hint}, {lang}. {age_hint}.",
+      # "voice_gender": "female",
+      # "voice_age": "32",
   }
-
-  # Вариант B: Silero — все реплики одним спикером (только target_language=ru)
-  # form = {
-  #     "project_name": "demo",
-  #     "source_language": "en",
-  #     "target_language": "ru",
-  #     "silero_speaker": "eugene",
-  #     "silero_all_replicas": "true",
-  # }
 
   with open(r"C:\path\to\diolog.mp4", "rb") as f:
       r = requests.post(
@@ -636,9 +561,12 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
     осознанно — артефакты проекта хранятся на сервере в data/projects/.
   - Длительность обработки: короткий ролик ~10–20 мин, длинный — дольше.
   - Языки source/target: коды ISO-подобные (en, ru) или полные имена — как в CLI.
-  - Silero TTS: только target_language = ru; для en/de/es/fr используйте Qwen (по умолчанию).
-  - Дубляж закадровый: не синхронизация губ, не клон голоса актёра.
+  - Дубляж закадровый: не синхронизация губ. Голос — VoiceDesign и/или клон
+    из сэмпла (свой upload или встроенный cast: Локи / Том Харди / Тор).
   - При status = error обратитесь к администратору с job id и текстом error.
+  - Повторный запуск того же project_name с SPEECHLAB_RESUME=1 пропускает
+    готовые шаги (demucs/нарезка при совпадении хешей; ASR/TTS — если
+    segment.wav не изменился).
 
 
 --------------------------------------------------------------------------------
@@ -646,6 +574,7 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
 --------------------------------------------------------------------------------
 
   GET  /health                        — ping (без ключа)
+  GET  /api/v1/cast-voices            — встроенные голоса (Локи / Том Харди / Тор)
   POST /api/v1/dub                    — создать задачу
   GET  /api/v1/jobs                   — список задач
   GET  /api/v1/jobs/<id>              — статус задачи
@@ -659,7 +588,7 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
 14. Обновление облачного сервера (для администратора)
 --------------------------------------------------------------------------------
 
-После выхода новой версии (voice_sample_*, Silero TTS) выполните на сервере
+После выхода новой версии (cast-voices, voice_sample_*, VoiceDesign) выполните на сервере
 (SSH под root или deploy-пользователем):
 
   # 1. Остановить сервис
@@ -667,31 +596,31 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
 
   # 2. Обновить код
   cd /opt/speechlab
-  git pull
+  sudo -u speechlab git pull
 
   # 3. Зависимости (если менялся requirements.txt)
   sudo -u speechlab /opt/speechlab/.venv/bin/pip install -r requirements.txt -r requirements-server.txt
 
-  # 4. Silero: при первом запуске torch.hub скачает snakers4/silero-models (~десятки МБ)
-  #    Нужен доступ в интернет с сервера или предзагрузка кэша hub
-
-  # 5. Системные пакеты (ffmpeg уже нужен; для mp3-сэмплов достаточно ffmpeg)
+  # 4. Системные пакеты (ffmpeg уже нужен; для mp3-сэмплов достаточно ffmpeg)
   apt-get update && apt-get install -y ffmpeg sox libsndfile1
 
-  # 6. Каталог для загружаемых сэмплов
+  # 5. Каталог для загружаемых сэмплов + проверка data/Cast
   mkdir -p /opt/speechlab/server/uploads/voice_samples
+  ls -la /opt/speechlab/data/Cast/*.wav
   chown -R speechlab:speechlab /opt/speechlab/server/uploads
 
-  # 7. Проверка синтаксиса
-  sudo -u speechlab /opt/speechlab/.venv/bin/python -m py_compile tools/dubbing.py tools/silero_tts.py server/routes.py main.py
+  # 6. Проверка синтаксиса
+  sudo -u speechlab /opt/speechlab/.venv/bin/python -m py_compile \
+    tools/dubbing.py tools/cast_voices.py server/routes.py main.py
 
-  # 8. Запуск
+  # 7. Запуск
   systemctl daemon-reload
   systemctl start speechlab
   systemctl status speechlab
 
-  # 9. Smoke-test
+  # 8. Smoke-test
   curl -s https://app.vandum.ru/health
+  curl -s -H "X-API-Key: ВАШ_КЛЮЧ" https://app.vandum.ru/api/v1/cast-voices
   curl -s -H "X-API-Key: ВАШ_КЛЮЧ" https://app.vandum.ru/api/v1/jobs
 
 При git pull конфликтах (локальные правки на сервере):

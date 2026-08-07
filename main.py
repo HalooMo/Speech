@@ -8,6 +8,12 @@
   video → 16k → demucs → first_seg(40–90s) → ASR(test/asr) →
   перевод → casting → TTS → fit → full_dub → mux MP4
 
+Resume (SPEECHLAB_RESUME=1):
+  A — demucs/first_seg пропускаются, если vocals+segment хеши в pipeline_state совпали
+  B — ASR reuse при том же segment.wav + source_language;
+      перевод — ещё и тот же target_language;
+      casting/TTS — ещё и тот же voice_fingerprint (cast/промпт/сэмплы/микс)
+
 Отдельно: config/, server/, tools/ (TTS/LLM), prompt.py, test.py (ASR).
 """
 from __future__ import annotations
@@ -138,15 +144,22 @@ def _idx(name):
     return int(SPEECH_TXT.match(name).group(1))
 
 
-def _resume_ok(project_dir, video_path):
-    if not RESUME:
-        return False
+def _load_state(project_dir: Path) -> dict:
     p = project_dir / STATE_FILE
     if not p.is_file():
-        return False
+        return {}
     try:
-        prev = json.loads(p.read_text(encoding="utf-8"))
+        return json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return {}
+
+
+def _resume_ok(project_dir, video_path):
+    """True, если SPEECHLAB_RESUME=1 и входное видео не менялось (SHA256)."""
+    if not RESUME:
+        return False
+    prev = _load_state(project_dir)
+    if not prev:
         return False
     if prev.get("input_sha256") != _sha256(video_path):
         print("  resume: входной файл изменился")
@@ -154,12 +167,110 @@ def _resume_ok(project_dir, video_path):
     return True
 
 
+def _voice_fingerprint(
+    *,
+    voice_design_template=None,
+    voice_design_by_key=None,
+    voice_gender=None,
+    voice_age=None,
+    voice_design_temperature=None,
+    voice_clone_samples=None,
+    cast_voice=None,
+    cast_mode=None,
+    dub_volume_percent=None,
+    original_audio_ratio=None,
+) -> str:
+    """Отпечаток опций голоса/микса — смена → нельзя resume casting/TTS."""
+    clone_meta = []
+    for s in voice_clone_samples or []:
+        clone_meta.append({
+            "gender": s.get("gender"),
+            "path": str(s.get("path") or ""),
+            "age_groups": s.get("age_groups"),
+            "ref_text": s.get("ref_text"),
+        })
+    payload = {
+        "template": voice_design_template or "",
+        "by_key": voice_design_by_key or {},
+        "gender": voice_gender,
+        "age": voice_age,
+        "temp": voice_design_temperature,
+        "clone": clone_meta,
+        "cast_voice": (cast_voice or "").strip().lower() or None,
+        "cast_mode": (cast_mode or "").strip().lower() or None,
+        "dub_vol": dub_volume_percent,
+        "orig_ratio": original_audio_ratio,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _save_state(project_dir, video_path, **extra):
-    (project_dir / STATE_FILE).write_text(json.dumps({
+    """pipeline_state.json: хеш видео + vocals + каждого segment.wav (для A+B resume)."""
+    data = {
         "input_sha256": _sha256(video_path),
         "video_path": str(video_path.resolve()),
         **extra,
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    }
+    (project_dir / STATE_FILE).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def _segment_hashes(first_seg_dir: Path, manifest: list[dict]) -> dict[str, str]:
+    """folder → sha256(segment.wav) — вход ASR; смена хеша → нельзя reuse ASR."""
+    out = {}
+    for item in manifest:
+        folder = item["folder"]
+        seg = first_seg_dir / folder / "segment.wav"
+        if seg.is_file():
+            out[folder] = _sha256(seg)
+    return out
+
+
+def _load_manifest(first_seg_dir: Path) -> list[dict] | None:
+    path = first_seg_dir / "manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) and data else None
+
+
+def _can_skip_demucs_and_seg(
+    project_dir: Path,
+    project_vocals: Path,
+    stems_dir: Path,
+    first_seg_dir: Path,
+    state: dict,
+) -> tuple[bool, list[dict] | None, Path | None]:
+    """Вариант A: пропуск шагов 1–2, если vocals/music/manifest/сегменты на месте
+    и хеши совпадают с pipeline_state (вариант B).
+    """
+    music_ok = list(stems_dir.rglob("no_vocals.wav")) if stems_dir.is_dir() else []
+    if not project_vocals.is_file() or not music_ok:
+        return False, None, None
+    manifest = _load_manifest(first_seg_dir)
+    if not manifest:
+        return False, None, None
+    for item in manifest:
+        if not (first_seg_dir / item["folder"] / "segment.wav").is_file():
+            return False, None, None
+    # Старый state без хешей сегментов — не доверяем, пересоберём 1–2
+    saved_vocals = state.get("vocals_sha256")
+    saved_segs = state.get("segment_sha256") or {}
+    if not saved_vocals or not saved_segs:
+        return False, None, None
+    if saved_vocals != _sha256(project_vocals):
+        print("  resume: vocals.wav изменился — demucs/нарезка заново")
+        return False, None, None
+    cur_segs = _segment_hashes(first_seg_dir, manifest)
+    if cur_segs != saved_segs:
+        print("  resume: segment.wav изменились — demucs/нарезка заново")
+        return False, None, None
+    return True, manifest, music_ok[0]
 
 
 def _step_done(second_seg, step):
@@ -318,7 +429,7 @@ def translate_segments(second_seg, source_lang, target_lang):
         try:
             raw = llm.llm_response_retry(
                 prompt.get_prompt(3, {"source_lang": source_lang, "target_lang": target_lang, "lines": lines}),
-                json_only=False, batch_translate=True, retries=2,
+                json_only=False, batch_translate=True, retries=3,
             )
             for item in _parse_batch(raw):
                 rid, text = str(item.get("id", "")).strip(), str(item.get("text", "")).strip()
@@ -328,14 +439,22 @@ def translate_segments(second_seg, source_lang, target_lang):
             print(f"  batch перевод не удался ({exc}), по одной…")
 
         for txt, meta in batch:
-            translated = by_id.get(txt.name)
+            translated = (by_id.get(txt.name) or "").strip()
             if not translated:
-                orig = meta["text"]
-                translated = (llm.llm_response(prompt.get_prompt(2, {
-                    "text": orig, "source_lang": source_lang, "target_lang": target_lang,
-                    "source_chars": len(orig), "source_words": len(orig.split()),
-                    "slot_sec": float(meta["end"]) - float(meta["start"]),
-                })) or "").strip()
+                # одиночный перевод с retry (сеть + пустой/отказ)
+                try:
+                    translated = (llm.llm_response_retry(prompt.get_prompt(2, {
+                        "text": meta["text"], "source_lang": source_lang, "target_lang": target_lang,
+                        "source_chars": len(meta["text"]), "source_words": len(meta["text"].split()),
+                        "slot_sec": float(meta["end"]) - float(meta["start"]),
+                    }), retries=3) or "").strip()
+                except Exception as exc:
+                    print(f"  перевод {txt.name} ошибка ({exc})")
+                    translated = ""
+            # Пустой ответ LLM → не пишем пустой target (TTS упадёт); берём исходник
+            if not translated:
+                print(f"  перевод {txt.name}: пусто → исходный текст")
+                translated = meta["text"]
             (target_dir / txt.name).write_text(
                 f"{meta['start']:.2f} - {meta['end']:.2f}\n{meta['speaker']}\n{translated}",
                 encoding="utf-8")
@@ -348,6 +467,7 @@ def translate_segments(second_seg, source_lang, target_lang):
 # =============================================================================
 def build_casting(second_seg, *, unload=True):
     from tools import dubbing
+    from tools.cast_voices import assign_cast_to_speakers
     from tools.get_param import profile_from_wav, unload_model
 
     audio_dir = second_seg / "output_audio_segments"
@@ -371,21 +491,32 @@ def build_casting(second_seg, *, unload=True):
             "start": e["meta"]["start"], "end": e["meta"]["end"], "profile": profile,
         }
 
+    # Режим speakers: каждому спикеру — cast_id из data/Cast (Локи / Том Харди / Тор)
+    cast_map = {}
+    if dubbing.cast_mode() == "speakers" and dubbing.cast_ids():
+        speakers = sorted({e["speaker"] for e in entries})
+        cast_map = assign_cast_to_speakers(speakers)
+        print(f"  cast speakers: {cast_map}")
+
     if CAST_PER_SPEAKER and entries:
         by_spk = {}
         for e in entries:
             by_spk.setdefault(e["speaker"], []).append(e)
-        profiles = {
-            spk: dubbing.apply_voice_override(
+        profiles = {}
+        for spk, items in by_spk.items():
+            p = dubbing.apply_voice_override(
                 profile_from_wav(max(items, key=lambda x: x["dur"])["wav"]))
-            for spk, items in by_spk.items()
-        }
+            if spk in cast_map:
+                p["cast_id"] = cast_map[spk]
+            profiles[spk] = p
         for e in entries:
             casting["segments"][e["txt"].name] = entry(e, profiles[e["speaker"]])
     else:
         for e in entries:
-            casting["segments"][e["txt"].name] = entry(
-                e, dubbing.apply_voice_override(profile_from_wav(e["wav"])))
+            p = dubbing.apply_voice_override(profile_from_wav(e["wav"]))
+            if e["speaker"] in cast_map:
+                p["cast_id"] = cast_map[e["speaker"]]
+            casting["segments"][e["txt"].name] = entry(e, p)
 
     (second_seg / "casting.json").write_text(
         json.dumps(casting, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -399,16 +530,14 @@ def build_casting(second_seg, *, unload=True):
 # =============================================================================
 def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
     from tools import dubbing
-    from tools.dubbing import dub_from_profile, ensure_voice_bank, needs_qwen_bank, unload_model
+    from tools.dubbing import dub_from_profile, ensure_voice_bank, unload_model
     from tools.fit_audio import match_loudness
 
     lang = _tts_lang(target_lang)
-    if not bank_ready and needs_qwen_bank(lang):
+    if not bank_ready:
         print("  TTS: банк 8 голосов…")
         ensure_voice_bank(lang)
         bank_ready = True
-    elif not bank_ready and dubbing.silero_enabled(lang):
-        print("  TTS: Silero (ru)")
 
     casting = json.loads((second_seg / "casting.json").read_text(encoding="utf-8"))
     seg_map = casting.get("segments", {})
@@ -420,6 +549,9 @@ def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
     for txt in _list_txt(target_dir):
         meta = _parse_txt(txt)
         if not meta:
+            continue
+        if not (meta.get("text") or "").strip():
+            print(f"  пропуск {txt.name}: пустой текст (нет озвучки)")
             continue
         profile = dubbing.apply_voice_override(seg_map.get(txt.name, {}).get("profile", {}))
         wavs = list(audio_dir.glob(f"speech_{_idx(txt.name):03d}_*.wav"))
@@ -435,7 +567,6 @@ def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
     if unload:
         unload_model()
     return final_dir
-
 
 # =============================================================================
 # Шаги 7–9: склейка, микс, mux
@@ -577,71 +708,146 @@ def run(
     voice_age=None,
     voice_design_temperature=None,
     voice_clone_samples=None,
-    silero_speaker=None,
-    silero_all_replicas=False,
-    silero_age_groups=None,
-    silero_voices=None,
+    cast_voice=None,
+    cast_mode=None,
     projects_root=None,
 ):
     """Единая точка входа пайплайна (CLI и Flask worker)."""
     from tools import dubbing
-    from tools.dubbing import ensure_voice_bank, needs_qwen_bank, unload_model as unload_tts
+    from tools.cast_voices import list_cast_voices, resolve_cast_voice, to_clone_sample
+    from tools.dubbing import ensure_voice_bank, unload_model as unload_tts
     from tools.get_param import unload_model as unload_casting
 
     video_path = Path(video_path).resolve()
     if not video_path.is_file():
         raise FileNotFoundError(video_path)
+    # Защита от path traversal в имени проекта (как в API)
+    if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", str(project_name or "")):
+        raise ValueError("project_name: только буквы, цифры, _ и - (до 64)")
 
     project_dir = _projects_root(projects_root) / project_name
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- встроенные cast-голоса (data/Cast): один пресет или раздача по спикерам ---
+    clone_samples = list(voice_clone_samples or [])
+    cast_list = None
+    mode = (cast_mode or "").strip().lower() or None
+    if (cast_voice or "").strip():
+        one = resolve_cast_voice(cast_voice)
+        # Cast первым: пользовательский voice_sample_* поверх перезапишет те же слоты
+        clone_samples = [to_clone_sample(one, age_groups=None)] + clone_samples
+        if not voice_gender:
+            voice_gender = one["gender"]
+        print(f"  cast_voice: {one['name']} ({one['id']})")
+    elif mode == "speakers":
+        cast_list = []
+        for info in list_cast_voices():
+            if not info["available"]:
+                raise FileNotFoundError(f"cast sample missing: {info['sample_path']}")
+            cast_list.append({
+                "id": info["id"],
+                "path": info["sample_path"],
+                "ref_text": info["ref_text"],
+            })
+        print(f"  cast_mode=speakers: {[c['id'] for c in cast_list]}")
+    elif mode:
+        raise ValueError(f"cast_mode: ожидается speakers, получено {cast_mode!r}")
+
     # --- голос на этот прогон (сброс в finally) ---
     use_bank = bool(
         (voice_design_template or "").strip() or voice_design_by_key
-        or voice_design_temperature is not None or voice_clone_samples
+        or voice_design_temperature is not None or clone_samples or cast_list
     )
     dubbing.set_voice_prompts(
         template=voice_design_template, by_key=voice_design_by_key,
         cache_dir=project_dir / "voice_bank" if use_bank else None,
         gender=voice_gender, age=voice_age, design_temperature=voice_design_temperature,
     )
-    dubbing.set_voice_clone_samples(voice_clone_samples)
-    if (silero_speaker or "").strip() or silero_voices:
-        from tools import silero_tts
-        if not silero_tts.is_russian_target(target_language):
-            raise ValueError("Silero TTS только при target_language=ru")
-        dubbing.set_silero_options(
-            speaker=silero_speaker, all_replicas=bool(silero_all_replicas),
-            age_groups=silero_age_groups, voices=silero_voices,
-        )
+    dubbing.set_voice_clone_samples(clone_samples or None)
+    dubbing.set_cast_voices(cast_list, mode=mode)
+
+    voice_fp = _voice_fingerprint(
+        voice_design_template=voice_design_template,
+        voice_design_by_key=voice_design_by_key,
+        voice_gender=voice_gender,
+        voice_age=voice_age,
+        voice_design_temperature=voice_design_temperature,
+        voice_clone_samples=clone_samples or None,
+        cast_voice=cast_voice,
+        cast_mode=mode,
+        dub_volume_percent=dub_volume_percent,
+        original_audio_ratio=original_audio_ratio,
+    )
 
     token = hf_token or get_hf_token()
     try:
-        # --- 1 demucs ---
-        print("=== 1. Аудио 16 kHz + demucs ===")
+        first_seg_dir = project_dir / "first_seg"
         project_vocals = project_dir / "vocals.wav"
         stems_dir = project_dir / "demucs_stems"
-        music_ok = list(stems_dir.rglob("no_vocals.wav")) if stems_dir.is_dir() else []
-        if SKIP_DEMUCS and project_vocals.is_file() and music_ok:
-            music_stem = music_ok[0]
-            print("  demucs: пропуск")
+        prev_state = _load_state(project_dir)
+        resume_video = _resume_ok(project_dir, video_path)
+
+        # Resume downstream: языки и голос должны совпадать с прошлым прогоном
+        same_source = (
+            (prev_state.get("source_language") or "").strip().lower()
+            == (source_language or "").strip().lower()
+        )
+        same_target = (
+            (prev_state.get("target_language") or "").strip().lower()
+            == (target_language or "").strip().lower()
+        )
+        same_voice = prev_state.get("voice_fingerprint") == voice_fp
+        if resume_video and not same_source:
+            print("  resume: source_language изменился — ASR заново")
+        if resume_video and same_source and not same_target:
+            print("  resume: target_language изменился — перевод/TTS заново")
+        if resume_video and same_source and same_target and not same_voice:
+            print("  resume: опции голоса/микса изменились — casting/TTS заново")
+
+        # --- 1–2: A — пропуск demucs/нарезки при совпадении хешей; иначе пересборка ---
+        print("=== 1. Аудио 16 kHz + demucs ===")
+        skip_12, manifest, music_stem = False, None, None
+        if resume_video:
+            skip_12, manifest, music_stem = _can_skip_demucs_and_seg(
+                project_dir, project_vocals, stems_dir, first_seg_dir, prev_state,
+            )
+
+        if skip_12:
+            print("  demucs + first_seg: пропуск (resume, хеши vocals/segment совпали)")
         else:
-            audio_16k = project_dir / "audio_16k.wav"
-            extract_audio_16k(video_path, audio_16k)
-            vocals_wav, music_stem = separate_stems(audio_16k, stems_dir)
-            project_vocals.write_bytes(vocals_wav.read_bytes())
-            print(f"vocals: {project_vocals}")
+            music_ok = list(stems_dir.rglob("no_vocals.wav")) if stems_dir.is_dir() else []
+            if SKIP_DEMUCS and project_vocals.is_file() and music_ok:
+                music_stem = music_ok[0]
+                print("  demucs: пропуск (SPEECHLAB_SKIP_DEMUCS)")
+            else:
+                audio_16k = project_dir / "audio_16k.wav"
+                extract_audio_16k(video_path, audio_16k)
+                vocals_wav, music_stem = separate_stems(audio_16k, stems_dir)
+                project_vocals.write_bytes(vocals_wav.read_bytes())
+                print(f"vocals: {project_vocals}")
 
-        # --- 2 first_seg ---
-        print("=== 2. Первичная нарезка ===")
-        first_seg_dir = project_dir / "first_seg"
-        manifest = split_primary_segments(project_vocals, first_seg_dir)
-        resume = _resume_ok(project_dir, video_path)
-        _save_state(project_dir, video_path, source_language=source_language, target_language=target_language)
+            print("=== 2. Первичная нарезка ===")
+            manifest = split_primary_segments(project_vocals, first_seg_dir)
 
-        # --- 3 ASR ---
+        # Актуальные хеши входов ASR (вариант B)
+        vocals_sha = _sha256(project_vocals) if project_vocals.is_file() else ""
+        seg_hashes = _segment_hashes(first_seg_dir, manifest)
+        saved_segs = prev_state.get("segment_sha256") or {}
+
+        _save_state(
+            project_dir, video_path,
+            source_language=source_language,
+            target_language=target_language,
+            voice_fingerprint=voice_fp,
+            vocals_sha256=vocals_sha,
+            segment_sha256=seg_hashes,
+        )
+
+        # --- 3 ASR: reuse только если segment.wav и source_language те же ---
         print("=== 3. ASR ===")
         jobs = []
+        # folder → можно ли reuse ASR (и все зависимые шаги 4–6)
+        reuse_asr_for: dict[str, bool] = {}
         n_replicas = 0
         init_asr_models(source_language, token)
         try:
@@ -650,11 +856,23 @@ def run(
                 second = primary / "second_seg"
                 second.mkdir(parents=True, exist_ok=True)
                 jobs.append((primary, second))
-                print(f"--- {item['folder']} ---")
-                if resume and _step_done(second, "asr"):
-                    print("  ASR: resume")
+                folder = item["folder"]
+                seg_same = (
+                    resume_video
+                    and bool(seg_hashes.get(folder))
+                    and saved_segs.get(folder) == seg_hashes.get(folder)
+                )
+                can_reuse = seg_same and same_source and _step_done(second, "asr")
+                reuse_asr_for[folder] = can_reuse
+                print(f"--- {folder} ---")
+                if can_reuse:
+                    print("  ASR: resume (segment.wav не менялся)")
                     n_replicas += len(_list_txt(second / "output_text_segments"))
                 else:
+                    if resume_video and _step_done(second, "asr") and not seg_same:
+                        print("  ASR: segment.wav изменился — пересчёт")
+                    elif resume_video and _step_done(second, "asr") and not same_source:
+                        print("  ASR: source_language изменился — пересчёт")
                     n_replicas += len(run_segment_pipeline(
                         primary / "segment.wav",
                         second / "output_audio_segments",
@@ -668,38 +886,44 @@ def run(
             raise ValueError("ASR не нашёл реплик. Проверьте source_language и vocals.")
         print(f"  реплик: {n_replicas}")
 
-        # --- 4 translate ---
+        # --- 4–6: downstream resume только если ASR reuse + те же язык/голос ---
         print("=== 4. Перевод ===")
-        for _, second in jobs:
-            if resume and _step_done(second, "translate"):
-                print("  перевод: resume")
+        for primary, second in jobs:
+            folder = primary.name
+            if reuse_asr_for.get(folder) and same_target and _step_done(second, "translate"):
+                print(f"  перевод {folder}: resume")
                 continue
             translate_segments(second, source_language, target_language)
 
-        # --- 5 casting ---
         print("=== 5. casting ===")
-        for _, second in jobs:
-            if resume and _step_done(second, "casting"):
-                print("  casting: resume")
+        for primary, second in jobs:
+            folder = primary.name
+            if (
+                reuse_asr_for.get(folder)
+                and same_target
+                and same_voice
+                and _step_done(second, "casting")
+            ):
+                print(f"  casting {folder}: resume")
                 continue
             build_casting(second, unload=False)
         unload_casting()
 
-        # --- 6 TTS ---
         print("=== 6. TTS ===")
         lang = _tts_lang(target_language)
-        if needs_qwen_bank(lang):
-            ensure_voice_bank(lang)
-            bank_ready = True
-        elif dubbing.silero_enabled(lang):
-            print("  Silero, Qwen пропущен")
-            bank_ready = False
-        else:
-            ensure_voice_bank(lang)
-            bank_ready = True
-        for _, second in jobs:
-            if resume and _step_done(second, "dub"):
-                print("  TTS: resume")
+        ensure_voice_bank(lang)
+        bank_ready = True
+        for primary, second in jobs:
+            folder = primary.name
+            if (
+                reuse_asr_for.get(folder)
+                and same_target
+                and same_voice
+                and _step_done(second, "translate")
+                and _step_done(second, "casting")
+                and _step_done(second, "dub")
+            ):
+                print(f"  TTS {folder}: resume")
                 continue
             dub_segments(second, target_language, unload=False, bank_ready=bank_ready)
         unload_tts()

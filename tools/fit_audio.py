@@ -58,13 +58,12 @@ def _rms(y: np.ndarray) -> float:
 def match_loudness(dub_wav, original_wav, *, max_gain=8.0, min_rms=1e-4):
     """Подогнать громкость дубляжа под оригинальную реплику (RMS).
 
-    Зачем: TTS часто тише/громче исходной речи → на фоне demucs-шума
-    дубляж «тонет» или наоборот орёт. Делаем сразу после TTS на паре
-    final_audio/*_dub.wav ↔ output_audio_segments/speech_*.wav.
+    1) gain = rms_orig / rms_dub (с потолком max_gain)
+    2) gain ограничивается так, чтобы peak ≤ 0.98 — без глобального
+       «сжать весь файл после усиления» (это ломало RMS-матч)
+    3) редкие выбросы выше 0.98 — soft knee (tanh), не линейный scale всего сигнала
 
-    max_gain — потолок усиления (линейный множитель), чтобы не раздувать шум
-    на почти тихих оригиналах. После gain — peak ≤ 0.98 (anti-clip).
-    Перезаписывает dub_wav на месте. Возвращает применённый gain.
+    Перезаписывает dub_wav. Возвращает фактически применённый gain.
     """
     dub_path = Path(dub_wav)
     orig_path = Path(original_wav)
@@ -79,19 +78,29 @@ def match_loudness(dub_wav, original_wav, *, max_gain=8.0, min_rms=1e-4):
         orig = orig.mean(axis=1)
 
     rms_d, rms_o = _rms(dub), _rms(orig)
-    # Оригинал или дубль почти тихие — не трогаем (иначе gain → ∞)
     if rms_d < min_rms or rms_o < min_rms:
         return 1.0
 
     gain = float(np.clip(rms_o / rms_d, 1.0 / max_gain, max_gain))
+    # Не усиливаем сильнее, чем позволяет peak (иначе пришлось бы давить весь файл)
+    peak_d = float(np.max(np.abs(dub))) or 1e-9
+    gain = min(gain, 0.98 / peak_d)
     if abs(gain - 1.0) < 0.02:
         return 1.0
 
-    out = dub * gain
-    peak = float(np.max(np.abs(out))) or 1.0
-    if peak > 1.0:
-        out = out / peak * 0.98
-    sf.write(dub_path, out.astype(np.float32), sr_d)
+    out = (dub * gain).astype(np.float32)
+    # Soft limiter только на сэмплах выше порога — RMS почти не страдает
+    lim = 0.98
+    abs_o = np.abs(out)
+    mask = abs_o > lim
+    if np.any(mask):
+        excess = abs_o[mask] - lim
+        scale = float(np.max(excess)) or 1e-9
+        soft = lim + (0.99 - lim) * np.tanh(excess / scale)
+        out = out.copy()
+        out[mask] = np.sign(out[mask]) * soft.astype(np.float32)
+
+    sf.write(dub_path, out, sr_d)
     return gain
 
 
@@ -161,16 +170,12 @@ def schedule_placements(segments, max_stretch=None):
     items.sort(key=lambda x: x["s"])
 
     # --- Фаза 2: play_start с учётом overflow и смены спикера ---
-    out, cursor, overlap_at, prev_spk = [], 0.0, None, None
+    out, cursor, prev_spk = [], 0.0, None
     for it in items:
         overflow = it["dur"] > it["slot"] + 0.02
         diff_spk = prev_spk and it["spk"] and prev_spk != it["spk"]
-        if overlap_at is not None:
-            # Продолжение overlay с исходного времени реплики
-            start = overlap_at
-            overlap_at = None
-        elif overflow and diff_spk:
-            # Другой спикер + не влезли в слот → накладываем с start реплики
+        if overflow and diff_spk:
+            # Другой спикер + не влезли в слот → накладываем с собственного start
             start = it["s"]
         else:
             # Один спикер или влезли — ставим после предыдущей или с start
@@ -178,6 +183,4 @@ def schedule_placements(segments, max_stretch=None):
         out.append((start, it["p"]))
         cursor = start + it["dur"]
         prev_spk = it["spk"] or prev_spk
-        if overflow and diff_spk:
-            overlap_at = it["s"]
     return out
