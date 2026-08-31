@@ -4,7 +4,7 @@
 voice_key (male_mature и т.д.) в tools/dubbing.py.
 
 Эмоция (Dpngtm/wav2vec2) опциональна — по умолчанию SPEECHLAB_SKIP_EMOTION=1,
-т.к. Qwen TTS в текущем пайплайне эмоцию из casting не использует.
+т.к. эмоции для Fish TTS задаёт LLM тегами [brackets] в target_text.
 """
 import gc
 import os
@@ -150,7 +150,7 @@ def profile_from_wav(audio_path, *, with_emotion=None):
 
 
 def unload_model():
-    """Выгрузить wav2vec из VRAM перед Qwen TTS (main вызывает после casting)."""
+    """Выгрузить wav2vec из VRAM перед Fish TTS (main вызывает после casting)."""
     global _emotion, _age
     _emotion = {"fe": None, "model": None}
     _age = {"proc": None, "model": None, "dev": None}

@@ -1,4 +1,4 @@
-"""Встроенные голоса для Qwen3-TTS Base clone (data/Cast).
+"""Встроенные голоса для Fish TTS clone (data/Cast).
 
 Использование:
   cast_voice=loki|tom_hardy|thor  — один голос на все мужские слоты
@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CAST_DIR = ROOT / "data" / "Cast"
 
-# id → отображаемое имя, файл, эталонный текст для create_voice_clone_prompt
+# id → отображаемое имя, файл, эталонный текст для Fish voices.create
 _VOICES: list[dict] = [
     {
         "id": "loki",

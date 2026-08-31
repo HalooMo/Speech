@@ -90,19 +90,20 @@ curl.exe -X POST "https://app.vandum.ru/api/v1/dub" ^
   -F "project_name=demo" ^
   -F "source_language=en" ^
   -F "target_language=ru" ^
+  -F "cast_voice=loki" ^
   -F "video=@C:\Users\Имя\Videos\diolog.mp4"
 
---- 4.2. Загрузка с настройкой голоса (VoiceDesign) ---
+--- 4.2. Загрузка со своим сэмплом клонирования ---
 
 curl.exe -X POST "https://app.vandum.ru/api/v1/dub" ^
   -H "X-API-Key: ВАШ_КЛЮЧ" ^
   -F "project_name=demo" ^
   -F "source_language=en" ^
   -F "target_language=ru" ^
-  -F "voice_prompt=Warm {gender_hint} narrator, {lang}. {age_hint}, cinematic dubbing." ^
-  -F "voice_gender=female" ^
+  -F "voice_sample_male=@C:\Users\Имя\voice_male.wav" ^
+  -F "voice_sample_male_ref_text=Hello, this is my reference voice sample." ^
+  -F "voice_gender=male" ^
   -F "voice_age=32" ^
-  -F "voice_design_temperature=0.72" ^
   -F "video=@C:\Users\Имя\Videos\diolog.mp4"
 
 --- 4.3. PowerShell (удобнее с путями) ---
@@ -112,6 +113,7 @@ curl.exe -X POST "https://app.vandum.ru/api/v1/dub" `
   -F "project_name=demo" `
   -F "source_language=en" `
   -F "target_language=ru" `
+  -F "cast_mode=speakers" `
   -F "video=@$env:USERPROFILE\Videos\diolog.mp4"
 
 --- 4.4. Linux / macOS ---
@@ -121,6 +123,7 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
   -F "project_name=demo" \
   -F "source_language=en" \
   -F "target_language=ru" \
+  -F "cast_voice=loki" \
   -F "video=@/home/user/diolog.mp4"
 
 --- 4.5. JSON (файл уже лежит на сервере) ---
@@ -133,7 +136,7 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
     "source_language": "en",
     "target_language": "ru",
     "video_path": "/opt/speechlab/server/uploads/demo_diolog.mp4",
-    "voice_prompt": "Natural {gender_hint}, {lang}. {age_hint}.",
+    "cast_voice": "loki",
     "voice_gender": "male",
     "voice_age": 40
   }'
@@ -154,9 +157,9 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
     "result_path": null,
     "error": null,
     "options": {
-      "voice_design_template": "Warm ...",
-      "voice_gender": "female",
-      "voice_age": 32
+      "cast_voice": "loki",
+      "voice_gender": "male",
+      "voice_age": 40
     },
     "pid": 26832
   }
@@ -165,51 +168,37 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
 
 
 --------------------------------------------------------------------------------
-5. Опциональные параметры дубляжа
+5. Параметры дубляжа (голос обязателен)
 --------------------------------------------------------------------------------
 
 Передаются в той же форме (multipart) или в JSON-теле POST /api/v1/dub.
 
-Голос (Qwen3-TTS VoiceDesign — для всех языков):
-  voice_prompt              — текст промпта для дизайна голоса
-  voice_design_template     — то же, что voice_prompt
-  voice_design_prompt       — то же, что voice_prompt
-  voice_gender / gender     — male | female (для всех реплик)
-  voice_age                 — возраст в годах, число (напр. 32)
-  voice_design_temperature  — 0..1, «креативность» TTS (по умолчанию ~0.72)
-  voice_design_by_key       — JSON: промпт отдельно для типа голоса
+Озвучка — Fish Audio TTS (модель s2.1-pro), только клонирование.
+Без сэмпла или cast задача НЕ запустится (HTTP 400).
 
-Плейсхолдеры в voice_prompt:
-  {lang}         — язык дубляжа (Russian, English, …)
-  {gender_hint}  — masculine male voice / feminine female voice
-  {age_hint}     — child | teen | adult
+Обязательно одно из:
+  voice_sample_male / voice_sample_female — файлы mp3/wav
+  voice_clone_samples — JSON-массив с путями к сэмплам
+  cast_voice — встроенный пресет (loki / tom_hardy / thor)
+  cast_mode=speakers — раздать cast-голоса по спикерам
 
-Ключи voice_design_by_key (пол × возрастная группа):
-  male_child, male_teenager, male_mature, male_elderly
-  female_child, female_teenager, female_mature, female_elderly
-
-Пример voice_design_by_key в multipart (строка JSON):
-  -F 'voice_design_by_key={"male_mature":"deep baritone narrator","female_teenager":"bright young voice"}'
-
-Пример в JSON-теле:
-  "voice_design_by_key": {
-    "male_mature": "deep baritone narrator",
-    "female_teenager": "bright young voice"
-  }
+Опционально (поверх клона):
+  voice_gender / gender  — male | female (override casting для всех реплик)
+  voice_age              — возраст в годах, число (напр. 32)
 
 Громкость и микс:
   dub_volume_percent      — громкость дубляжа, % (по умолчанию 100)
   original_audio_ratio    — доля оригинальной дорожки в финале (0..1, по умолчанию 0.3)
 
 Если voice_gender / voice_age не заданы — пол и возраст определяются автоматически
-по аудио каждой реплики (casting).
+по аудио каждой реплики (casting). Эмоции и тон задаёт LLM тегами [happy], [whispering]
+и т.п. прямо в переведённом тексте (Fish S2 bracket-syntax).
 
 
---- 5.1. Клонирование голоса из аудио-сэмпла (опционально) ---
+--- 5.1. Клонирование голоса из аудио-сэмпла ---
 
-Можно передать короткий аудио-файл (.mp3 или .wav, до 10 МБ) вместо генерации
-голоса только через текстовый промпт. Сэмпл задаётся отдельно для мужского
-и/или женского пола.
+Короткий аудио-файл (.mp3 или .wav, до 10 МБ) клонируется через Fish Audio
+и используется для озвучки. Сэмпл задаётся отдельно для мужского и/или женского пола.
 
 Возрастные группы (4 штуки):
   child      — ребёнок
@@ -218,8 +207,8 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
   elderly    — пожилой
 
 Поля multipart:
-  voice_sample_male           — файл mp3/wav (опционально)
-  voice_sample_female         — файл mp3/wav (опционально)
+  voice_sample_male           — файл mp3/wav
+  voice_sample_female         — файл mp3/wav
   voice_sample_male_ages      — child,teenager,mature,elderly (опционально)
   voice_sample_female_ages    — то же (опционально)
   voice_sample_male_ref_text  — точный текст, произнесённый в сэмпле (рекомендуется)
@@ -227,13 +216,10 @@ curl -X POST "https://app.vandum.ru/api/v1/dub" \
 
 Если *_ages не указаны — сэмпл применяется ко ВСЕМ 4 возрастным группам
 данного пола. Например, voice_sample_male без ages → male_child, male_teenager,
-male_mature, male_elderly используют один и тот же голос.
-
-Если сэмпл не передан — голос генерируется по текущей схеме (VoiceDesign +
-промпт, если задан). Можно комбинировать: сэмпл для male, промпт для female.
+male_mature, male_elderly используют один и тот же клон.
 
 Рекомендации к сэмплу:
-  - 3–10 секунд чистой речи без музыки и шума
+  - 10–30 секунд чистой речи без музыки и шума (лучше для Fish)
   - один спикер, нормальная громкость
   - ref_text должен дословно совпадать с тем, что сказано в сэмпле
 
@@ -290,14 +276,13 @@ JSON (файлы уже на сервере):
   -F "voice_sample_male=@voice.wav"
 
 Как это работает на сервере:
-  - Слоты с сэмплом: референс конвертируется в WAV и клонируется через Qwen3-TTS
-  - Слоты без сэмпла: голос создаётся моделью VoiceDesign (промпт или дефолт)
-  - Озвучка реплик: Qwen3-TTS Base clone по профилю casting (пол + возраст)
+  - Сэмпл конвертируется в WAV и клонируется через Fish Audio (s2.1-pro)
+  - Озвучка реплик: Fish TTS по профилю casting (пол + возраст) или cast_id
+  - LLM добавляет эмоциональные теги [brackets] в перевод
   - После TTS громкость каждой реплики подгоняется под исходный speech_*.wav
-    (чтобы дубляж не тонул и не перекрикивал оригинал)
 
 
---- 5.2. Встроенные cast-голоса (data/Cast, Qwen 1.7 Base clone) ---
+--- 5.2. Встроенные cast-голоса (data/Cast, Fish clone) ---
 
 На сервере лежат 3 готовых эталона для клонирования. Их не нужно загружать
 файлом — достаточно указать id или русское имя.
@@ -357,10 +342,8 @@ JSON:
 
 или: "cast_voice": "thor"
 
-Можно комбинировать cast с VoiceDesign для слотов без сэмпла (например,
-cast_voice закрывает male_*, female остаётся на VoiceDesign + voice_prompt).
-Загрузка своих voice_sample_* по-прежнему доступна (раздел 5.1) и имеет
-приоритет на пересекающихся слотах, если передана вместе с cast.
+Загрузка своих voice_sample_* доступна (раздел 5.1) и имеет приоритет на
+пересекающихся слотах, если передана вместе с cast.
 
 
 --------------------------------------------------------------------------------
@@ -473,6 +456,7 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
     -F "project_name=myfilm" ^
     -F "source_language=en" ^
     -F "target_language=ru" ^
+    -F "cast_voice=loki" ^
     -F "voice_gender=female" ^
     -F "voice_age=30" ^
     -F "video=@C:\path\to\video.mp4"
@@ -508,7 +492,6 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
       "source_language": "en",
       "target_language": "ru",
       "cast_mode": "speakers",  # или cast_voice="loki" / "Локи"
-      # "voice_prompt": "Natural {gender_hint}, {lang}. {age_hint}.",
       # "voice_gender": "female",
       # "voice_age": "32",
   }
@@ -561,7 +544,8 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
     осознанно — артефакты проекта хранятся на сервере в data/projects/.
   - Длительность обработки: короткий ролик ~10–20 мин, длинный — дольше.
   - Языки source/target: коды ISO-подобные (en, ru) или полные имена — как в CLI.
-  - Дубляж закадровый: не синхронизация губ. Голос — VoiceDesign и/или клон
+  - Дубляж закадровый: не синхронизация губ. Голос — только Fish clone
+    (свой сэмпл или cast_voice / cast_mode)
     из сэмпла (свой upload или встроенный cast: Локи / Том Харди / Тор).
   - При status = error обратитесь к администратору с job id и текстом error.
   - Повторный запуск того же project_name с SPEECHLAB_RESUME=1 пропускает
@@ -588,7 +572,7 @@ curl -H "X-API-Key: ВАШ_КЛЮЧ" \
 14. Обновление облачного сервера (для администратора)
 --------------------------------------------------------------------------------
 
-После выхода новой версии (cast-voices, voice_sample_*, VoiceDesign) выполните на сервере
+После выхода новой версии (cast-voices, voice_sample_*, Fish TTS) выполните на сервере
 (SSH под root или deploy-пользователем):
 
   # 1. Остановить сервис

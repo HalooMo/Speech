@@ -69,22 +69,6 @@ def _opt_str_any(*keys: str) -> str | None:
     return None
 
 
-# --- VoiceDesign: шаблоны промптов по ключу (male_mature и т.д.) ---
-def _parse_voice_design_by_key() -> dict | None:
-    raw = _json_body().get("voice_design_by_key")
-    if isinstance(raw, dict) and raw:
-        return raw
-    form_raw = request.form.get("voice_design_by_key")
-    if form_raw:
-        try:
-            parsed = json.loads(form_raw)
-            if isinstance(parsed, dict) and parsed:
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
 # --- Валидация возрастных групп для клонирования голоса ---
 def _parse_age_groups(raw: str | list | None) -> list[str] | None:
     """None → все 4 возрастные группы."""
@@ -259,25 +243,15 @@ def _parse_voice_clone_samples(cfg, project_name: str) -> list[dict] | None:
     return samples or None
 
 
-# --- Опции дубляжа: громкость, VoiceDesign, температура ---
+# --- Опции дубляжа: громкость, gender/age override ---
 def _parse_options() -> dict:
-    """Опции дубляжа: голос, громкость, промпт VoiceDesign."""
-    voice_prompt = _opt_str_any(
-        "voice_prompt",
-        "voice_design_prompt",
-        "voice_design_template",
-    )
+    """Опции дубляжа: громкость и override пола/возраста."""
     opts = {
         "dub_volume_percent": _opt_float("dub_volume_percent"),
         "original_audio_ratio": _opt_float("original_audio_ratio"),
-        "voice_design_template": voice_prompt,
         "voice_gender": _opt_str_any("voice_gender", "gender"),
         "voice_age": _opt_float("voice_age"),
-        "voice_design_temperature": _opt_float("voice_design_temperature"),
     }
-    by_key = _parse_voice_design_by_key()
-    if by_key:
-        opts["voice_design_by_key"] = by_key
     return {k: v for k, v in opts.items() if v is not None}
 
 
@@ -290,7 +264,6 @@ def _merge_options(project_name: str) -> dict:
     cast_voice = _opt_str_any("cast_voice", "voice_cast")
     cast_mode = _opt_str_any("cast_mode")
     if cast_voice:
-        # Проверка id/имени на этапе API (файл data/Cast должен существовать)
         from tools.cast_voices import resolve_cast_voice
         resolve_cast_voice(cast_voice)
         opts["cast_voice"] = cast_voice
@@ -301,6 +274,11 @@ def _merge_options(project_name: str) -> dict:
         opts["cast_mode"] = mode
     if cast_voice and cast_mode:
         raise ValueError("Укажите либо cast_voice, либо cast_mode — не оба сразу")
+    if not opts.get("voice_clone_samples") and not cast_voice and not cast_mode:
+        raise ValueError(
+            "Нужен голос: voice_sample_male/female, voice_clone_samples, "
+            "cast_voice или cast_mode=speakers"
+        )
     return opts
 
 
@@ -317,7 +295,7 @@ def health():
     })
 
 
-# --- GET /api/v1/cast-voices — встроенные пресеты Qwen clone (data/Cast) ---
+# --- GET /api/v1/cast-voices — встроенные пресеты Fish clone (data/Cast) ---
 @bp.get("/api/v1/cast-voices")
 def cast_voices():
     """Список встроенных голосов (нужен API-ключ, как у остальных /api/*)."""
@@ -330,24 +308,15 @@ def cast_voices():
 def create_dub():
     """Запуск дубляжа: multipart (video) или JSON {video_path, project_name, ...}.
 
-    Промпт VoiceDesign (опционально):
-      voice_prompt / voice_design_template — шаблон с плейсхолдерами
-        {lang}, {gender_hint}, {age_hint}
-      voice_gender — male | female (для всех реплик)
-      voice_age — возраст в годах (число)
-      voice_design_temperature — 0..1
-      voice_design_by_key — JSON, напр. {"male_mature": "deep baritone narrator"}
+    Голос обязателен (Fish TTS только с клонированием):
+      voice_sample_male / voice_sample_female — файлы mp3/wav
+      voice_clone_samples — JSON-массив
+      cast_voice — id или имя: loki|tom_hardy|thor
+      cast_mode=speakers — раздать cast-голоса по спикерам
 
-    Клонирование голоса из аудио-сэмпла (опционально, mp3/wav до 10 МБ):
-      voice_sample_male / voice_sample_female — файлы
-      voice_sample_male_ages / voice_sample_female_ages — child,teenager,mature,elderly
-        (пусто = все 4 группы)
-      voice_sample_male_ref_text / voice_sample_female_ref_text — транскрипт сэмпла
-      voice_clone_samples — JSON-массив (расширенный формат)
-
-    Встроенные cast-голоса (data/Cast, Qwen Base clone):
-      cast_voice — id или имя: loki|tom_hardy|thor | Локи|Том Харди|Тор
-      cast_mode=speakers — раздать все 3 голоса по спикерам (по кругу)
+    Опционально:
+      voice_gender / voice_age — override casting
+      dub_volume_percent / original_audio_ratio — микс
     """
     cfg = _cfg()
     store = _store()

@@ -1,75 +1,45 @@
-"""Qwen3-TTS: озвучка дубляжа (PRD шаг 6).
+"""Fish Audio TTS: озвучка дубляжа через клонирование (PRD шаг 6).
 
 Схема:
-  1) ensure_voice_bank — 8 эталонов (male/female × 4 возраста):
-     VoiceDesign ИЛИ клон из пользовательского сэмпла → .wav в voice_bank
-  2) Base model create_voice_clone_prompt — эмбеддинг голоса по эталону
-  3) dub_from_profile — синтез реплики по тексту + профилю из casting.json
+  1) ensure_voice_bank — Fish voices.create из сэмплов (clone / cast)
+  2) dub_from_profile — s2.1-pro + reference_id; эмоции уже в тексте ([brackets])
 
-Кэш: .speechlab_voice_bank/ или voice_bank/ проекта при кастомных промптах/сэмплах.
+Без VoiceDesign: нужен voice_clone_samples и/или cast_voice / cast_mode.
 """
-import gc
+from __future__ import annotations
+
 import json
 import os
 import subprocess
 from pathlib import Path
 
-import numpy as np
-
-# =============================================================================
-# Модели Qwen, кэш эталонов, ключи голосов (8 = 2 пола × 4 возраста)
-# =============================================================================
-MODEL_DESIGN = os.environ.get("SPEECHLAB_TTS_DESIGN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
-MODEL_BASE = os.environ.get("SPEECHLAB_TTS_BASE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+# Модель TTS: самая мощная в линейке Fish (заголовок model)
+FISH_MODEL = os.environ.get("SPEECHLAB_FISH_MODEL", "s2.1-pro")
 _env_cache = os.environ.get("SPEECHLAB_VOICE_CACHE", "")
-CACHE_ROOT = Path(_env_cache).expanduser() if _env_cache else Path(__file__).resolve().parent.parent / ".speechlab_voice_bank"
+CACHE_ROOT = (
+    Path(_env_cache).expanduser()
+    if _env_cache
+    else Path(__file__).resolve().parent.parent / ".speechlab_voice_bank"
+)
 
 GENDERS = ("male", "female")
 AGE_GROUPS = ("child", "teenager", "mature", "elderly")
 VOICE_KEYS = [f"{g}_{a}" for g in GENDERS for a in AGE_GROUPS]
-MAP_LANG = {
-    "ru": "Russian", "russian": "Russian", "en": "English", "english": "English",
-    "de": "German", "german": "German", "es": "Spanish", "spanish": "Spanish",
-    "fr": "French", "french": "French", "auto": "Auto",
-}
-GENDER_HINT = {"male": "masculine male voice", "female": "feminine female voice, warm timbre"}
-AGE_HINT = {
-    "child": "child",
-    "teenager": "teen",
-    "mature": "adult",
-    "elderly": "adult",
-}
 
-# Тексты и шаблоны VoiceDesign по умолчанию (переопределяются через API / set_voice_prompts)
-REF_TEXT = {
-    "Russian": "Знаешь, я сейчас скажу как есть — без занудства, просто по-человечески, как в жизни разговаривают.",
-    "English": "Look, I'll just say it the way people actually talk — not stiff, not like a presenter, just natural.",
-    "German": "Ich sag's einfach so, wie man im echten Gespräch redet — locker und natürlich.",
-    "Spanish": "Te lo digo como en la vida real, sin tono de locutor, natural y cercano.",
-    "French": "Je le dis comme dans la vraie vie, pas comme à la radio — naturel et vivant.",
-}
-DESIGN_TEMPLATE = "Natural {gender_hint}, {lang}. {age_hint}."
-REF_TEXT_BY_KEY = {}
-DESIGN_BY_KEY = {}
-DESIGN_TEMP = 0.72
+# reference_id по ключу "male_mature" / "cast_loki"
+_voice_ids: dict[str, str] = {}
+_client = None
 
-# Ленивая загрузка моделей в VRAM (один экземпляр Design + Base на процесс)
-_design_inst = None
-_base_inst = None
-# clone-prompts: ключ "Russian/male_mature" → объект для generate_voice_clone
-_clone_prompts = {}
-
-# Параметры текущего run() из main.run() / API (сбрасываются в clear_voice_prompts)
 _active = {
-    "template": None, "by_key": None, "cache_root": None,
-    "gender": None, "age": None, "design_temp": None,
+    "cache_root": None,
+    "gender": None,
+    "age": None,
     "clone_by_key": None,  # voice_key → {path, ref_text}
-    "cast_by_id": None,  # cast_id → {path, ref_text} — встроенные голоса data/Cast
-    "cast_mode": None,  # None | "speakers" — раздача cast по спикерам
+    "cast_by_id": None,  # cast_id → {path, ref_text}
+    "cast_mode": None,  # None | "speakers"
 }
 
 
-# --- Маппинг возраста в годах → возрастная группа для voice_key ---
 def age_to_group(age):
     """Возраст (лет) → child | teenager | mature | elderly."""
     age = float(age)
@@ -94,8 +64,23 @@ def _norm_gender(gender):
     raise ValueError(f"voice_gender: ожидается male/female, получено {gender!r}")
 
 
+def get_fish_api_key() -> str:
+    """Ключ Fish TTS из config/.env (FISH_TTS_API_KEY или FISH_API_KEY)."""
+    from config.env_config import get_fish_tts_api_key
+    return get_fish_tts_api_key()
+
+
+def _fish():
+    """Ленивый клиент Fish Audio."""
+    global _client
+    if _client is None:
+        from fishaudio import FishAudio
+        _client = FishAudio(api_key=get_fish_api_key())
+    return _client
+
+
 # =============================================================================
-# Настройка голоса на один прогон run() (вызывается из main.run / server API)
+# Настройка голоса на один прогон run()
 # =============================================================================
 def set_voice_prompts(
     template=None,
@@ -106,13 +91,14 @@ def set_voice_prompts(
     age=None,
     design_temperature=None,
 ):
-    """Параметры голоса для текущего видео. cache_dir — папка проекта (voice_bank)."""
-    _active["template"] = (template or "").strip() or None
-    _active["by_key"] = dict(by_key) if by_key else None
+    """Параметры голоса для текущего видео (gender/age override + cache_dir).
+
+    template / by_key / design_temperature игнорируются (VoiceDesign удалён).
+    """
+    _ = (template, by_key, design_temperature)
     _active["cache_root"] = Path(cache_dir) if cache_dir else None
     _active["gender"] = _norm_gender(gender)
     _active["age"] = float(age) if age is not None else None
-    _active["design_temp"] = float(design_temperature) if design_temperature is not None else None
 
 
 def clear_voice_prompts():
@@ -128,7 +114,7 @@ def set_cast_voices(
 ) -> None:
     """Встроенные cast-голоса (Локи / Том Харди / Тор).
 
-    voices: [{"id", "path", "ref_text"}, ...] — эталоны cast_<id> в банке.
+    voices: [{"id", "path", "ref_text"}, ...] — эталоны cast_<id>.
     mode="speakers" — в casting каждому спикеру назначается cast_id по кругу.
     """
     if not voices:
@@ -175,13 +161,11 @@ def _norm_age_groups(age_groups) -> list[str]:
     return out
 
 
-# --- Пользовательские аудио-сэмплы: один WAV/MP3 → несколько voice_key по age_groups ---
 def set_voice_clone_samples(samples: list[dict] | None) -> None:
     """Аудио-сэмплы для клонирования: пол + возрастные группы → voice_key.
 
     samples: [{"gender": "male"|"female", "path": str|Path,
                "age_groups": list[str]|None, "ref_text": str|None}, ...]
-    age_groups=None → все 4 группы. ref_text=None → x_vector_only_mode (ниже качество).
     """
     if not samples:
         _active["clone_by_key"] = None
@@ -201,18 +185,14 @@ def set_voice_clone_samples(samples: list[dict] | None) -> None:
     _active["clone_by_key"] = expanded or None
 
 
-# --- Флаги кастомизации голоса в текущем run() ---
 def has_custom_voice_bank() -> bool:
-    """Нужен ли отдельный voice_bank проекта (промпты и/или clone-сэмплы)."""
-    a = _active
-    return bool(
-        a["template"] or a["by_key"] or a["design_temp"] is not None
-        or a["clone_by_key"] or a["cast_by_id"]
-    )
+    """Нужен ли отдельный voice_bank проекта (clone/cast сэмплы)."""
+    return bool(_active["clone_by_key"] or _active["cast_by_id"])
 
 
 def uses_custom_voice() -> bool:
-    return bool(_active["template"] or _active["by_key"] or _active["design_temp"] is not None)
+    """VoiceDesign удалён — всегда False (совместимость вызовов)."""
+    return False
 
 
 def uses_custom_clone() -> bool:
@@ -223,7 +203,15 @@ def has_voice_profile_override() -> bool:
     return bool(_active["gender"] or _active["age"] is not None)
 
 
-# --- Подстановка voice_gender/voice_age из API поверх детекции по WAV (casting) ---
+def require_clone_sources() -> None:
+    """Без clone/cast озвучка невозможна (нет VoiceDesign)."""
+    if not uses_custom_clone():
+        raise ValueError(
+            "Нужен голос для Fish TTS: voice_clone_samples / voice_sample_* "
+            "или cast_voice / cast_mode=speakers"
+        )
+
+
 def apply_voice_override(profile):
     """Подставить voice_gender / voice_age из run() в профиль casting."""
     p = dict(profile or {})
@@ -236,12 +224,7 @@ def apply_voice_override(profile):
     return p
 
 
-def _design_temp():
-    return _active["design_temp"] if _active["design_temp"] is not None else DESIGN_TEMP
-
-
 def _bank_root():
-    """Корень voice_bank: глобальный кэш или папка проекта."""
     return _active["cache_root"] if _active["cache_root"] else CACHE_ROOT
 
 
@@ -250,7 +233,6 @@ def _settings_meta_path():
 
 
 def _clone_samples_meta() -> dict:
-    """Снимок путей/mtime сэмплов — для инвалидации банка при смене файла."""
     if not _active["clone_by_key"]:
         return {}
     meta = {}
@@ -265,7 +247,6 @@ def _clone_samples_meta() -> dict:
 
 
 def _cast_samples_meta() -> dict:
-    """Снимок встроенных cast-сэмплов для voice_settings.json."""
     if not _active["cast_by_id"]:
         return {}
     meta = {}
@@ -280,21 +261,15 @@ def _cast_samples_meta() -> dict:
 
 
 def _current_settings_meta():
-    """Текущие промпты/температура/сэмплы — сравнивается с voice_settings.json."""
     return {
-        "prompts": {
-            "template": _active["template"],
-            "by_key": _active["by_key"] or {},
-            "design_temperature": _design_temp(),
-        },
         "clone_samples": _clone_samples_meta(),
         "cast_samples": _cast_samples_meta(),
         "cast_mode": _active["cast_mode"],
+        "fish_model": FISH_MODEL,
     }
 
 
 def _settings_changed():
-    """Кастомные настройки изменились — нужна перегенерация банка."""
     if not has_custom_voice_bank():
         return False
     p = _settings_meta_path()
@@ -308,7 +283,6 @@ def _settings_changed():
 
 
 def _save_settings_meta():
-    """Записать voice_settings.json после пересборки банка."""
     if not has_custom_voice_bank():
         return
     _bank_root().mkdir(parents=True, exist_ok=True)
@@ -317,38 +291,8 @@ def _save_settings_meta():
     )
 
 
-# =============================================================================
-# Тексты для VoiceDesign и выбор voice_key из casting profile
-# =============================================================================
-def map_lang(language):
-    """Код языка → имя для Qwen."""
-    return MAP_LANG.get((language or "").strip().lower(), language)
-
-
-def ref_line(lang, voice_key):
-    """Текст эталона для VoiceDesign и clone."""
-    if voice_key in REF_TEXT_BY_KEY:
-        return REF_TEXT_BY_KEY[voice_key]
-    return REF_TEXT.get(lang, REF_TEXT["English"])
-
-
-def design_instruct(lang, gender, age, voice_key):
-    """Описание голоса для VoiceDesign."""
-    by_key = {**DESIGN_BY_KEY, **(_active["by_key"] or {})}
-    if voice_key in by_key:
-        return by_key[voice_key]
-    tmpl = _active["template"] or DESIGN_TEMPLATE
-    gender_hint = GENDER_HINT.get(gender, gender)
-    if isinstance(age, (int, float)) or (isinstance(age, str) and age.replace(".", "", 1).isdigit()):
-        age_hint = f"speaker age {int(round(float(age)))}, natural delivery"
-    else:
-        age_hint = AGE_HINT.get(age, age)
-    return tmpl.format(lang=lang, gender_hint=gender_hint, age_hint=age_hint)
-
-
 def normalize_voice_key(profile):
-    """casting profile → male_mature / cast_loki и т.п. для выбора эталона."""
-    # Явный cast_id (режим speakers) имеет приоритет над пол×возраст
+    """casting profile → male_mature / cast_loki и т.п."""
     cast_id = (profile.get("cast_id") or profile.get("cast_voice") or "").strip()
     if cast_id:
         from tools.cast_voices import voice_key_for_cast
@@ -365,26 +309,21 @@ def normalize_voice_key(profile):
     return f"{gender}_{age}"
 
 
-def _cache_dir(lang):
-    """Подкаталог банка по языку: .speechlab_voice_bank/russian/…"""
-    return _bank_root() / lang.lower().replace(" ", "_")
-
-
 def _clone_spec(voice_key: str) -> dict | None:
-    """Спека пользовательского clone-сэмпла для voice_key или None."""
     by_key = _active["clone_by_key"]
     if by_key and voice_key in by_key:
         return by_key[voice_key]
-    # cast_loki → запись в cast_by_id
     if voice_key.startswith("cast_") and _active["cast_by_id"]:
-        cid = voice_key[len("cast_"):]
-        return _active["cast_by_id"].get(cid)
+        return _active["cast_by_id"].get(voice_key[len("cast_"):])
     return None
 
 
 def _bank_voice_keys() -> list[str]:
-    """8 слотов пол×возраст + активные cast_*."""
-    keys = list(VOICE_KEYS)
+    """Только ключи, для которых есть сэмпл (clone или cast)."""
+    keys: list[str] = []
+    for vk in (_active["clone_by_key"] or {}):
+        if vk not in keys:
+            keys.append(vk)
     for cid in (_active["cast_by_id"] or {}):
         vk = f"cast_{cid}"
         if vk not in keys:
@@ -392,15 +331,16 @@ def _bank_voice_keys() -> list[str]:
     return keys
 
 
-# =============================================================================
-# Подготовка эталонных WAV и загрузка Qwen3-TTS
-# =============================================================================
+def _meta_path(vk: str) -> Path:
+    return _bank_root() / f"{vk}.meta.json"
+
+
 def _prepare_ref_wav(src: Path, dst: Path) -> None:
-    """mp3/wav → mono WAV для Qwen clone (ffmpeg)."""
+    """mp3/wav → mono WAV 44.1 kHz для Fish clone."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
-        "-vn", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+        "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
         str(dst),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -409,180 +349,105 @@ def _prepare_ref_wav(src: Path, dst: Path) -> None:
         raise RuntimeError(f"ffmpeg не конвертировал {src.name}: {tail}")
 
 
-def _install_clone_sample(spec: dict, wav_path: Path, lang: str, voice_key: str) -> None:
-    """Пользовательский сэмпл → эталон в voice_bank."""
-    src = Path(spec["path"])
-    _prepare_ref_wav(src, wav_path)
-    ref_text = spec.get("ref_text")
-    txt_path = wav_path.with_suffix(".txt")
-    if ref_text:
-        txt_path.write_text(ref_text, encoding="utf-8")
-    elif txt_path.is_file():
-        txt_path.unlink()
-    meta = {
-        "voice_key": voice_key,
-        "source": str(src.resolve()),
-        "ref_text": ref_text,
-        "custom_clone": True,
+def _create_fish_voice(vk: str, wav_path: Path, ref_text: str | None) -> str:
+    """Загрузить сэмпл в Fish → вернуть reference_id."""
+    client = _fish()
+    audio = wav_path.read_bytes()
+    kwargs = {
+        "title": f"speechlab_{vk}",
+        "voices": [audio],
+        "visibility": "private",
+        "train_mode": "fast",
+        "enhance_audio_quality": True,
     }
-    (wav_path.parent / f"{voice_key}.meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
-    print(f"    {voice_key} ← clone sample ({src.name})")
-
-
-def _patch_talker():
-    """Фикс pad_token_id в Qwen3 (иначе generate падает на некоторых конфигах)."""
-    from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSTalkerConfig
-    if getattr(Qwen3TTSTalkerConfig, "_speechlab_patched", False):
-        return
-    orig = Qwen3TTSTalkerConfig.__init__
-
-    def _init(self, *a, **kw):
-        orig(self, *a, **kw)
-        if getattr(self, "pad_token_id", None) is None:
-            self.pad_token_id = getattr(self, "codec_pad_id", 4196)
-
-    Qwen3TTSTalkerConfig.__init__ = _init
-    Qwen3TTSTalkerConfig._speechlab_patched = True
-
-
-def _load_qwen(model_id):
-    """Загрузить Qwen3TTSModel на cuda:0 или CPU."""
-    import torch
-    from qwen_tts import Qwen3TTSModel
-    _patch_talker()
-    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    return Qwen3TTSModel.from_pretrained(model_id, device_map=dev, dtype=dtype, attn_implementation="sdpa")
-
-
-def _design_model():
-    """Синглтон VoiceDesign (создаёт эталонные WAV)."""
-    global _design_inst
-    if _design_inst is None:
-        print("  TTS: VoiceDesign…")
-        _design_inst = _load_qwen(MODEL_DESIGN)
-    return _design_inst
-
-
-def _base_model():
-    """Синглтон Base (clone prompt + синтез реплик)."""
-    global _base_inst
-    if _base_inst is None:
-        print("  TTS: Base clone…")
-        _base_inst = _load_qwen(MODEL_BASE)
-    return _base_inst
-
-
-def _free_design():
-    """Выгрузить VoiceDesign из VRAM после генерации эталонов."""
-    global _design_inst
-    import torch
-    _design_inst = None
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if ref_text:
+        kwargs["texts"] = [ref_text]
+    voice = client.voices.create(**kwargs)
+    return voice.id
 
 
 # =============================================================================
-# Сборка voice_bank: 8 эталонов + create_voice_clone_prompt для каждого
+# Сборка voice_bank: сэмплы → Fish reference_id
 # =============================================================================
-def ensure_voice_bank(language, force=False):
-    """Создать эталоны .wav + clone-prompts в кэше (8 слотов + cast_*)."""
-    global _clone_prompts
-    lang = map_lang(language)
-    cache = _cache_dir(lang)
-    cache.mkdir(parents=True, exist_ok=True)
+def ensure_voice_bank(language=None, force=False):
+    """Клонировать голоса в Fish и закэшировать reference_id."""
+    global _voice_ids
+    _ = language  # язык на выбор модели не влияет; клон по сэмплу
+    require_clone_sources()
     bank_keys = _bank_voice_keys()
+    if not bank_keys:
+        raise ValueError("Нет сэмплов для клонирования (clone/cast пусты)")
 
-    # Смена промптов/сэмплов → пересоздать банк
+    root = _bank_root()
+    root.mkdir(parents=True, exist_ok=True)
+
     if has_custom_voice_bank() and _settings_changed():
         force = True
 
-    need = force or not all((cache / f"{vk}.wav").is_file() for vk in bank_keys)
-    if need:
-        import soundfile as sf
-        clone_keys = set(_active["clone_by_key"] or {})
-        # Встроенные cast_* всегда ставятся из сэмпла, не через VoiceDesign
-        for cid in (_active["cast_by_id"] or {}):
-            clone_keys.add(f"cast_{cid}")
-        # Ключи без пользовательского сэмпла — генерируем через VoiceDesign
-        design_keys = [vk for vk in bank_keys if vk not in clone_keys]
-        if clone_keys:
-            print(f"  TTS: clone samples ({lang})…")
-            for vk in bank_keys:
-                spec = _clone_spec(vk)
-                if not spec:
-                    continue
-                wav_path = cache / f"{vk}.wav"
-                if wav_path.is_file() and not force:
-                    continue
-                _install_clone_sample(spec, wav_path, lang, vk)
-        if design_keys:
-            print(f"  TTS: VoiceDesign ({len(design_keys)} голосов, {lang})…")
-            design = _design_model()
-            for vk in design_keys:
-                gender, age = vk.split("_", 1)
-                wav_path = cache / f"{vk}.wav"
-                if wav_path.is_file() and not force:
-                    continue
-                line = ref_line(lang, vk)
-                instr = design_instruct(lang, gender, age, vk)
-                temp = _design_temp()
-                wavs, sr = design.generate_voice_design(
-                    text=line, language=lang, instruct=instr,
-                    temperature=temp, non_streaming_mode=True,
-                )
-                if not wavs:
-                    raise RuntimeError(f"VoiceDesign: нет аудио для {vk}")
-                sf.write(wav_path, np.asarray(wavs[0], dtype=np.float32).squeeze(), sr)
-                (cache / f"{vk}.txt").write_text(line, encoding="utf-8")
-                (cache / f"{vk}.instruct.txt").write_text(instr, encoding="utf-8")
-                meta = {
-                    "voice_key": vk, "ref_text": line,
-                    "design_instruct": instr, "design_temperature": temp,
-                }
-                (cache / f"{vk}.meta.json").write_text(
-                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
-                )
-                print(f"    {vk}")
-            _free_design()
-        _save_settings_meta()
-
     if force:
-        _clone_prompts.clear()
-    # Base model: из каждого .wav строим voice_clone_prompt (кэш в памяти)
-    print(f"  TTS: clone-prompts ({lang})…")
-    base = _base_model()
+        _voice_ids.clear()
+
+    print(f"  TTS: Fish clone ({FISH_MODEL}, {len(bank_keys)} voices)...")
     for vk in bank_keys:
-        key = f"{lang}/{vk}"
-        if key in _clone_prompts and not force:
+        meta_p = _meta_path(vk)
+        if not force and meta_p.is_file() and vk in _voice_ids:
             continue
-        wav_path = cache / f"{vk}.wav"
-        txt_path = cache / f"{vk}.txt"
-        if not wav_path.is_file():
-            raise FileNotFoundError(wav_path)
+        if not force and meta_p.is_file() and vk not in _voice_ids:
+            try:
+                saved = json.loads(meta_p.read_text(encoding="utf-8"))
+                rid = (saved.get("reference_id") or "").strip()
+                if rid:
+                    _voice_ids[vk] = rid
+                    print(f"    {vk} <- cache {rid[:8]}...")
+                    continue
+            except json.JSONDecodeError:
+                pass
+
         spec = _clone_spec(vk)
-        # ref_text обязателен для качества; без него — x_vector_only_mode (хуже, но работает)
-        if spec and spec.get("ref_text"):
-            line = spec["ref_text"]
-            x_vector = False
-        elif txt_path.is_file():
-            line = txt_path.read_text(encoding="utf-8").strip()
-            x_vector = False
-        else:
-            line = ref_line(lang, vk)
-            x_vector = bool(spec)
-        _clone_prompts[key] = base.create_voice_clone_prompt(
-            ref_audio=str(wav_path),
-            ref_text=line,
-            x_vector_only_mode=x_vector,
-        )
+        if not spec:
+            raise FileNotFoundError(f"нет сэмпла для {vk}")
+        src = Path(spec["path"])
+        wav_path = root / f"{vk}.wav"
+        _prepare_ref_wav(src, wav_path)
+        ref_text = spec.get("ref_text")
+        if ref_text:
+            wav_path.with_suffix(".txt").write_text(ref_text, encoding="utf-8")
+        rid = _create_fish_voice(vk, wav_path, ref_text)
+        _voice_ids[vk] = rid
+        meta = {
+            "voice_key": vk,
+            "reference_id": rid,
+            "source": str(src.resolve()),
+            "ref_text": ref_text,
+            "fish_model": FISH_MODEL,
+        }
+        meta_p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"    {vk} <- fish {rid[:8]}...")
+
+    _save_settings_meta()
+
+
+def _resolve_reference_id(vk: str) -> str:
+    if vk in _voice_ids:
+        return _voice_ids[vk]
+    meta_p = _meta_path(vk)
+    if meta_p.is_file():
+        try:
+            rid = (json.loads(meta_p.read_text(encoding="utf-8")).get("reference_id") or "").strip()
+            if rid:
+                _voice_ids[vk] = rid
+                return rid
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(
+        f"Нет клонированного голоса для {vk!r}. "
+        "Передайте voice_sample_* / voice_clone_samples или cast_voice / cast_mode "
+        "с покрытием этого профиля (пол×возраст или cast)."
+    )
 
 
 # =============================================================================
-# Синтез одной реплики (вызывается из main.dub_segments)
+# Синтез одной реплики
 # =============================================================================
 def dub_tts(text, language, gender, age, out_path):
     """Озвучить одну реплику по полу/возрасту."""
@@ -592,39 +457,34 @@ def dub_tts(text, language, gender, age, out_path):
 
 
 def dub_from_profile(text, language, profile, out_path, *, bank_ready=False):
-    """Озвучка по casting.json через Qwen3-TTS."""
+    """Озвучка по casting.json через Fish TTS (clone + emo-теги в тексте)."""
     if not (text or "").strip():
         raise ValueError("text пустой")
     profile = apply_voice_override(profile or {})
-    lang = map_lang(language)
+    if not bank_ready:
+        ensure_voice_bank(language)
 
     vk = normalize_voice_key(profile)
-    if not bank_ready:
-        ensure_voice_bank(lang)
-    key = f"{lang}/{vk}"
-    prompt = _clone_prompts.get(key)
-    if prompt is None:
-        # Банк мог обновиться — пересобрать prompts
-        ensure_voice_bank(lang, force=True)
-        prompt = _clone_prompts[key]
-    import soundfile as sf
-    wavs, sr = _base_model().generate_voice_clone(
-        text=text.strip(), language=lang, voice_clone_prompt=prompt, non_streaming_mode=True,
+    rid = _resolve_reference_id(vk)
+
+    from fishaudio.types import TTSConfig
+
+    # model=str: SDK typing ещё без s2.1-pro, API принимает заголовок
+    audio = _fish().tts.convert(
+        text=text.strip(),
+        reference_id=rid,
+        format="wav",
+        config=TTSConfig(format="wav", sample_rate=44100, latency="normal"),
+        model=FISH_MODEL,  # type: ignore[arg-type]
     )
-    if not wavs:
-        raise RuntimeError("generate_voice_clone: нет аудио")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(out_path, np.asarray(wavs[0], dtype=np.float32).squeeze(), sr)
+    out_path.write_bytes(audio)
     return str(out_path.resolve())
 
 
 def unload_model():
-    """Освободить VRAM после этапа TTS (Qwen)."""
-    global _design_inst, _base_inst, _clone_prompts
-    import torch
-    _design_inst = _base_inst = None
-    _clone_prompts = {}
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    """Сброс кэша reference_id и клиента после этапа TTS."""
+    global _client, _voice_ids
+    _client = None
+    _voice_ids = {}

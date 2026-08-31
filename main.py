@@ -6,13 +6,13 @@
 
 Поток (сверху вниз в этом файле):
   video → 16k → demucs → first_seg(40–90s) → ASR(test/asr) →
-  перевод → casting → TTS → fit → full_dub → mux MP4
+  перевод(+emo tags) → casting → Fish TTS(clone) → fit → full_dub → mux MP4
 
 Resume (SPEECHLAB_RESUME=1):
   A — demucs/first_seg пропускаются, если vocals+segment хеши в pipeline_state совпали
   B — ASR reuse при том же segment.wav + source_language;
       перевод — ещё и тот же target_language;
-      casting/TTS — ещё и тот же voice_fingerprint (cast/промпт/сэмплы/микс)
+      casting/TTS — ещё и тот же voice_fingerprint (cast/сэмплы/микс)
 
 Отдельно: config/, server/, tools/ (TTS/LLM), prompt.py, test.py (ASR).
 """
@@ -169,11 +169,8 @@ def _resume_ok(project_dir, video_path):
 
 def _voice_fingerprint(
     *,
-    voice_design_template=None,
-    voice_design_by_key=None,
     voice_gender=None,
     voice_age=None,
-    voice_design_temperature=None,
     voice_clone_samples=None,
     cast_voice=None,
     cast_mode=None,
@@ -190,16 +187,14 @@ def _voice_fingerprint(
             "ref_text": s.get("ref_text"),
         })
     payload = {
-        "template": voice_design_template or "",
-        "by_key": voice_design_by_key or {},
         "gender": voice_gender,
         "age": voice_age,
-        "temp": voice_design_temperature,
         "clone": clone_meta,
         "cast_voice": (cast_voice or "").strip().lower() or None,
         "cast_mode": (cast_mode or "").strip().lower() or None,
         "dub_vol": dub_volume_percent,
         "orig_ratio": original_audio_ratio,
+        "tts": "fish",
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -441,12 +436,17 @@ def translate_segments(second_seg, source_lang, target_lang):
         for txt, meta in batch:
             translated = (by_id.get(txt.name) or "").strip()
             if not translated:
-                # одиночный перевод с retry (сеть + пустой/отказ)
+                # соседние реплики батча — контекст для эмо-тегов
+                neighbors = [
+                    f"{m['speaker']}: {m['text']}"
+                    for _, m in batch if m["text"]
+                ]
                 try:
                     translated = (llm.llm_response_retry(prompt.get_prompt(2, {
                         "text": meta["text"], "source_lang": source_lang, "target_lang": target_lang,
                         "source_chars": len(meta["text"]), "source_words": len(meta["text"].split()),
                         "slot_sec": float(meta["end"]) - float(meta["start"]),
+                        "context": "\n".join(neighbors),
                     }), retries=3) or "").strip()
                 except Exception as exc:
                     print(f"  перевод {txt.name} ошибка ({exc})")
@@ -455,6 +455,12 @@ def translate_segments(second_seg, source_lang, target_lang):
             if not translated:
                 print(f"  перевод {txt.name}: пусто → исходный текст")
                 translated = meta["text"]
+            # убрать случайные кавычки/markdown вокруг ответа
+            if translated.startswith("```"):
+                translated = re.sub(r"^```(?:\w+)?\s*", "", translated)
+                translated = re.sub(r"\s*```\s*$", "", translated).strip()
+            if len(translated) >= 2 and translated[0] == translated[-1] and translated[0] in "\"'":
+                translated = translated[1:-1].strip()
             (target_dir / txt.name).write_text(
                 f"{meta['start']:.2f} - {meta['end']:.2f}\n{meta['speaker']}\n{translated}",
                 encoding="utf-8")
@@ -535,7 +541,7 @@ def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
 
     lang = _tts_lang(target_lang)
     if not bank_ready:
-        print("  TTS: банк 8 голосов…")
+        print("  TTS: Fish voice bank…")
         ensure_voice_bank(lang)
         bank_ready = True
 
@@ -702,11 +708,8 @@ def run(
     hf_token=None,
     dub_volume_percent=None,
     original_audio_ratio=None,
-    voice_design_template=None,
-    voice_design_by_key=None,
     voice_gender=None,
     voice_age=None,
-    voice_design_temperature=None,
     voice_clone_samples=None,
     cast_voice=None,
     cast_mode=None,
@@ -753,25 +756,19 @@ def run(
     elif mode:
         raise ValueError(f"cast_mode: ожидается speakers, получено {cast_mode!r}")
 
-    # --- голос на этот прогон (сброс в finally) ---
-    use_bank = bool(
-        (voice_design_template or "").strip() or voice_design_by_key
-        or voice_design_temperature is not None or clone_samples or cast_list
-    )
+    # --- голос на этот прогон (сброс в finally); без clone/cast — ошибка ---
+    use_bank = bool(clone_samples or cast_list)
     dubbing.set_voice_prompts(
-        template=voice_design_template, by_key=voice_design_by_key,
         cache_dir=project_dir / "voice_bank" if use_bank else None,
-        gender=voice_gender, age=voice_age, design_temperature=voice_design_temperature,
+        gender=voice_gender, age=voice_age,
     )
     dubbing.set_voice_clone_samples(clone_samples or None)
     dubbing.set_cast_voices(cast_list, mode=mode)
+    dubbing.require_clone_sources()
 
     voice_fp = _voice_fingerprint(
-        voice_design_template=voice_design_template,
-        voice_design_by_key=voice_design_by_key,
         voice_gender=voice_gender,
         voice_age=voice_age,
-        voice_design_temperature=voice_design_temperature,
         voice_clone_samples=clone_samples or None,
         cast_voice=cast_voice,
         cast_mode=mode,

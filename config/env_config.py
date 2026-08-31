@@ -14,7 +14,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 
 def get_hf_token():
-    """Hugging Face — pyannote, Qwen TTS и др."""
+    """Hugging Face — pyannote, wav2vec2 и др."""
     t = os.environ.get("HF_TOKEN", "").strip()
     if not t:
         raise ValueError("HF_TOKEN не задан в config/.env")
@@ -35,3 +35,14 @@ def get_openai_base_url():
 
 def get_openai_model():
     return os.environ.get("OPENAI_MODEL", "openai/gpt-5.5").strip()
+
+
+def get_fish_tts_api_key():
+    """Fish Audio TTS — клонирование и озвучка (FISH_TTS_API_KEY)."""
+    k = (
+        os.environ.get("FISH_TTS_API_KEY", "").strip()
+        or os.environ.get("FISH_API_KEY", "").strip()
+    )
+    if not k:
+        raise ValueError("FISH_TTS_API_KEY не задан в config/.env")
+    return k

@@ -9,6 +9,7 @@ If you're not sure about something, don't guess, ask in the chat
 when working focus on PRD.md
 always test the code after change it
 don't update PRD.md and main-rules.mdc just read
+if there is no explicit hint of editing the project, don't do that
 
 #Style 
 Write the code as short, clear, and uncomplicated as possible.
