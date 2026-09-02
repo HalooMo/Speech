@@ -10,5 +10,4 @@ librosa
 pandas
 pyannote.audio
 whisperx
-speechbrain
 huggingface_hub

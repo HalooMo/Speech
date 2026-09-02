@@ -5,8 +5,9 @@
   API:  server/run_job.py → run(...)
 
 Поток (сверху вниз в этом файле):
-  video → 16k → demucs → first_seg(40–90s) → ASR(test/asr) →
-  перевод(+emo tags) → casting → Fish TTS(clone) → fit → full_dub → mux MP4
+  video → 16k → demucs → first_seg(40–90s) → ASR →
+  перевод(+emo tags) → casting → Fish TTS(clone, 44.1k) →
+  fit/timeline/full_dub/mux на OUT_SR (44.1k)
 
 Resume (SPEECHLAB_RESUME=1):
   A — demucs/first_seg пропускаются, если vocals+segment хеши в pipeline_state совпали
@@ -14,7 +15,7 @@ Resume (SPEECHLAB_RESUME=1):
       перевод — ещё и тот же target_language;
       casting/TTS — ещё и тот же voice_fingerprint (cast/сэмплы/микс)
 
-Отдельно: config/, server/, tools/ (TTS/LLM), prompt.py, test.py (ASR).
+Отдельно: config/, server/, tools/ (TTS/LLM), prompt.py, asr.py.
 """
 from __future__ import annotations
 
@@ -31,12 +32,14 @@ import numpy as np
 import prompt
 import soundfile as sf
 
+from asr import init_asr_models, run_segment_pipeline, unload_asr_models
 from config.env_config import get_hf_token
-from test import init_asr_models, run_segment_pipeline, unload_asr_models
 from tools import llm
 
 ROOT = Path(__file__).resolve().parent
-SR = 16000
+SR = 16000  # extract / demucs / ASR / casting
+# Пост-TTS (Fish уже 44.1k): таймлайн, full_dub, микс с оригиналом
+OUT_SR = int(os.environ.get("SPEECHLAB_OUT_SR", "44100"))
 
 SPEECH_TXT = re.compile(r"^speech_(\d+)\.txt$", re.I)
 TIME_LINE = re.compile(r"^\s*([\d.]+)\s*-\s*([\d.]+)\s*$")
@@ -295,10 +298,16 @@ def _step_done(second_seg, step):
 # =============================================================================
 # Шаг 1: аудио 16 kHz + demucs
 # =============================================================================
-def extract_audio_16k(video_path, out_wav):
+def extract_audio(video_path, out_wav, *, ar=SR):
+    """Вытащить mono PCM WAV с заданной частотой (ASR=16k, финальный микс=OUT_SR)."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     _run(["ffmpeg", "-y", "-i", str(video_path),
-          "-vn", "-acodec", "pcm_s16le", "-ar", str(SR), "-ac", "1", str(out_wav)])
+          "-vn", "-acodec", "pcm_s16le", "-ar", str(ar), "-ac", "1", str(out_wav)])
+
+
+def extract_audio_16k(video_path, out_wav):
+    """Совместимость: вход demucs/ASR всегда 16 kHz."""
+    return extract_audio(video_path, out_wav, ar=SR)
 
 
 def separate_stems(audio_wav, stems_dir):
@@ -542,7 +551,7 @@ def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
     lang = _tts_lang(target_lang)
     if not bank_ready:
         print("  TTS: Fish voice bank…")
-        ensure_voice_bank(lang)
+        ensure_voice_bank()
         bank_ready = True
 
     casting = json.loads((second_seg / "casting.json").read_text(encoding="utf-8"))
@@ -575,17 +584,18 @@ def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
     return final_dir
 
 # =============================================================================
-# Шаги 7–9: склейка, микс, mux
+# Шаги 7–9: склейка, микс, mux (всё на OUT_SR — качество Fish TTS)
 # =============================================================================
 def _timeline(placements, min_dur):
+    """Накладывает *_dub.wav на таймлайн первичного сегмента (OUT_SR)."""
     max_end = float(min_dur)
     for start, path in placements:
         max_end = max(max_end, start + _duration(path))
-    out = np.zeros(int(round(max_end * SR)), dtype=np.float32)
+    out = np.zeros(int(round(max_end * OUT_SR)), dtype=np.float32)
     for start, path in placements:
         raw, sr = sf.read(path, dtype="float32")
-        data = _resample_mono(raw, sr)
-        pos = int(round(start * SR))
+        data = _resample_mono(raw, sr, target=OUT_SR)
+        pos = int(round(start * OUT_SR))
         end = pos + len(data)
         if end > len(out):
             out = np.pad(out, (0, end - len(out)))
@@ -613,16 +623,18 @@ def restore_primary_segment(primary_dir):
 
     out = primary_dir / "restored.wav"
     if not slots:
+        # segment.wav = 16k → апсемпл до OUT_SR
         data, sr = sf.read(seg_wav, dtype="float32")
-        sf.write(out, _resample_mono(data, sr), SR)
+        sf.write(out, _resample_mono(data, sr, target=OUT_SR), OUT_SR)
         return out
     mixed = _timeline(schedule_placements(slots), _duration(seg_wav))
-    sf.write(out, mixed, SR)
-    print(f"  таймлайн: {len(slots)} реплик")
+    sf.write(out, mixed, OUT_SR)
+    print(f"  таймлайн: {len(slots)} реплик @ {OUT_SR} Hz")
     return out
 
 
 def restore_full_vocals(project_dir, manifest, music_stem):
+    """Собрать full_dub: restored (OUT_SR) + music stem (16k → OUT_SR)."""
     pieces, max_end = [], 0.0
     for item in manifest:
         folder = project_dir / "first_seg" / item["folder"]
@@ -630,29 +642,30 @@ def restore_full_vocals(project_dir, manifest, music_stem):
         if not wav.is_file():
             wav = folder / "segment.wav"
         data, sr = sf.read(wav, dtype="float32")
-        pieces.append((float(item["start"]), _resample_mono(data, sr)))
+        pieces.append((float(item["start"]), _resample_mono(data, sr, target=OUT_SR)))
         max_end = max(max_end, float(item["end"]))
 
-    n = int(round(max_end * SR))
+    n = int(round(max_end * OUT_SR))
     vocals = np.zeros(n, dtype=np.float32)
     for start, data in pieces:
-        pos = int(round(start * SR))
+        pos = int(round(start * OUT_SR))
         end = min(n, pos + len(data))
         vocals[pos:end] = data[: end - pos]
 
     music, sr_m = sf.read(music_stem, dtype="float32")
-    music = _resample_mono(music, sr_m)
+    music = _resample_mono(music, sr_m, target=OUT_SR)
     music = np.pad(music, (0, max(0, n - len(music))))[:n]
     mixed = vocals + music * 0.85
     peak = np.max(np.abs(mixed)) or 1.0
     if peak > 1.0:
         mixed = mixed / peak * 0.98
     out = project_dir / "full_dub.wav"
-    sf.write(out, mixed, SR)
+    sf.write(out, mixed, OUT_SR)
     return out
 
 
 def mix_dub_with_original(video_path, dub_wav, out_wav, *, original_ratio=None, dub_volume_percent=None):
+    """Микс full_dub + оригинал на OUT_SR (не даунсэмплим Fish)."""
     ratio = ORIGINAL_AUDIO_RATIO if original_ratio is None else original_ratio
     pct = DUB_VOLUME_PERCENT if dub_volume_percent is None else dub_volume_percent
     if pct <= 0:
@@ -663,10 +676,10 @@ def mix_dub_with_original(video_path, dub_wav, out_wav, *, original_ratio=None, 
         shutil.copy2(dub_wav, out_wav)
         return out_wav
 
-    orig_tmp = out_wav.parent / "_original_16k.wav"
-    extract_audio_16k(video_path, orig_tmp)
-    dub = _resample_mono(*sf.read(dub_wav, dtype="float32"))
-    orig = _resample_mono(*sf.read(orig_tmp, dtype="float32"))
+    orig_tmp = out_wav.parent / "_original_mix.wav"
+    extract_audio(video_path, orig_tmp, ar=OUT_SR)
+    dub = _resample_mono(*sf.read(dub_wav, dtype="float32"), target=OUT_SR)
+    orig = _resample_mono(*sf.read(orig_tmp, dtype="float32"), target=OUT_SR)
     n = max(len(dub), len(orig))
     dub = np.pad(dub, (0, max(0, n - len(dub))))[:n]
     orig = np.pad(orig, (0, max(0, n - len(orig))))[:n]
@@ -675,8 +688,8 @@ def mix_dub_with_original(video_path, dub_wav, out_wav, *, original_ratio=None, 
     if peak > 1.0:
         mixed = mixed / peak * 0.98
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(out_wav, mixed.astype(np.float32), SR)
-    print(f"  микс: дубляж × {gain * 100:.0f}% + оригинал × {ratio:.2f}")
+    sf.write(out_wav, mixed.astype(np.float32), OUT_SR)
+    print(f"  микс @{OUT_SR} Hz: дубляж × {gain * 100:.0f}% + оригинал × {ratio:.2f}")
     return out_wav
 
 
@@ -907,8 +920,7 @@ def run(
         unload_casting()
 
         print("=== 6. TTS ===")
-        lang = _tts_lang(target_language)
-        ensure_voice_bank(lang)
+        ensure_voice_bank()
         bank_ready = True
         for primary, second in jobs:
             folder = primary.name
@@ -926,11 +938,11 @@ def run(
         unload_tts()
 
         # --- 7–9 ---
-        print("=== 7. Склейка реплик ===")
+        print(f"=== 7. Склейка реплик @ {OUT_SR} Hz ===")
         for primary, _ in jobs:
             restore_primary_segment(primary)
 
-        print("=== 8. full_dub.wav ===")
+        print(f"=== 8. full_dub.wav @ {OUT_SR} Hz ===")
         full = restore_full_vocals(project_dir, manifest, music_stem)
 
         print("=== 9. mux MP4 ===")

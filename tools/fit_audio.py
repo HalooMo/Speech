@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-SR = 16000
 MAX_STRETCH = float(os.environ.get("SPEECHLAB_MAX_STRETCH", "0.10"))
 _rubberband = None
 

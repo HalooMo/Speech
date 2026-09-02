@@ -67,15 +67,11 @@ word_segments: {words}
 Output JSON: speech {{"type","start","end","speaker","text"}}, silence {{"type","start","end"}}"""
 
     if kind == 2:
-        if isinstance(value, dict):
-            text, src, tgt = value["text"], value["source_lang"], value["target_lang"]
-            chars = value.get("source_chars", len(text))
-            words = value.get("source_words", len(text.split()))
-            slot = value.get("slot_sec")
-            context = value.get("context") or ""
-        else:
-            text, src, tgt = value[0], value[1], value[2]
-            chars, words, slot, context = len(text), len(text.split()), None, ""
+        text, src, tgt = value["text"], value["source_lang"], value["target_lang"]
+        chars = value.get("source_chars", len(text))
+        words = value.get("source_words", len(text.split()))
+        slot = value.get("slot_sec")
+        context = value.get("context") or ""
         lo_c, hi_c = max(1, int(chars * 0.9)), max(2, int(chars * 1.1))
         lo_w, hi_w = max(1, int(words * 0.85)), max(1, int(words * 1.15))
         extra = f"\nSpoken duration of the slot is ~{float(slot):.2f}s — keep length speakable in that time." if slot and float(slot) > 0 else ""

@@ -4,7 +4,7 @@
   1) ensure_voice_bank — Fish voices.create из сэмплов (clone / cast)
   2) dub_from_profile — s2.1-pro + reference_id; эмоции уже в тексте ([brackets])
 
-Без VoiceDesign: нужен voice_clone_samples и/или cast_voice / cast_mode.
+Нужен voice_clone_samples и/или cast_voice / cast_mode.
 """
 from __future__ import annotations
 
@@ -22,9 +22,7 @@ CACHE_ROOT = (
     else Path(__file__).resolve().parent.parent / ".speechlab_voice_bank"
 )
 
-GENDERS = ("male", "female")
 AGE_GROUPS = ("child", "teenager", "mature", "elderly")
-VOICE_KEYS = [f"{g}_{a}" for g in GENDERS for a in AGE_GROUPS]
 
 # reference_id по ключу "male_mature" / "cast_loki"
 _voice_ids: dict[str, str] = {}
@@ -82,20 +80,8 @@ def _fish():
 # =============================================================================
 # Настройка голоса на один прогон run()
 # =============================================================================
-def set_voice_prompts(
-    template=None,
-    by_key=None,
-    cache_dir=None,
-    *,
-    gender=None,
-    age=None,
-    design_temperature=None,
-):
-    """Параметры голоса для текущего видео (gender/age override + cache_dir).
-
-    template / by_key / design_temperature игнорируются (VoiceDesign удалён).
-    """
-    _ = (template, by_key, design_temperature)
+def set_voice_prompts(*, cache_dir=None, gender=None, age=None):
+    """Параметры голоса для текущего видео (gender/age override + cache_dir)."""
     _active["cache_root"] = Path(cache_dir) if cache_dir else None
     _active["gender"] = _norm_gender(gender)
     _active["age"] = float(age) if age is not None else None
@@ -185,26 +171,13 @@ def set_voice_clone_samples(samples: list[dict] | None) -> None:
     _active["clone_by_key"] = expanded or None
 
 
-def has_custom_voice_bank() -> bool:
-    """Нужен ли отдельный voice_bank проекта (clone/cast сэмплы)."""
-    return bool(_active["clone_by_key"] or _active["cast_by_id"])
-
-
-def uses_custom_voice() -> bool:
-    """VoiceDesign удалён — всегда False (совместимость вызовов)."""
-    return False
-
-
 def uses_custom_clone() -> bool:
+    """Есть ли clone/cast сэмплы для Fish voices.create."""
     return bool(_active["clone_by_key"] or _active["cast_by_id"])
-
-
-def has_voice_profile_override() -> bool:
-    return bool(_active["gender"] or _active["age"] is not None)
 
 
 def require_clone_sources() -> None:
-    """Без clone/cast озвучка невозможна (нет VoiceDesign)."""
+    """Без clone/cast озвучка невозможна."""
     if not uses_custom_clone():
         raise ValueError(
             "Нужен голос для Fish TTS: voice_clone_samples / voice_sample_* "
@@ -270,7 +243,7 @@ def _current_settings_meta():
 
 
 def _settings_changed():
-    if not has_custom_voice_bank():
+    if not uses_custom_clone():
         return False
     p = _settings_meta_path()
     if not p.is_file():
@@ -283,7 +256,7 @@ def _settings_changed():
 
 
 def _save_settings_meta():
-    if not has_custom_voice_bank():
+    if not uses_custom_clone():
         return
     _bank_root().mkdir(parents=True, exist_ok=True)
     _settings_meta_path().write_text(
@@ -369,10 +342,9 @@ def _create_fish_voice(vk: str, wav_path: Path, ref_text: str | None) -> str:
 # =============================================================================
 # Сборка voice_bank: сэмплы → Fish reference_id
 # =============================================================================
-def ensure_voice_bank(language=None, force=False):
+def ensure_voice_bank(force=False):
     """Клонировать голоса в Fish и закэшировать reference_id."""
     global _voice_ids
-    _ = language  # язык на выбор модели не влияет; клон по сэмплу
     require_clone_sources()
     bank_keys = _bank_voice_keys()
     if not bank_keys:
@@ -381,7 +353,7 @@ def ensure_voice_bank(language=None, force=False):
     root = _bank_root()
     root.mkdir(parents=True, exist_ok=True)
 
-    if has_custom_voice_bank() and _settings_changed():
+    if uses_custom_clone() and _settings_changed():
         force = True
 
     if force:
@@ -449,20 +421,14 @@ def _resolve_reference_id(vk: str) -> str:
 # =============================================================================
 # Синтез одной реплики
 # =============================================================================
-def dub_tts(text, language, gender, age, out_path):
-    """Озвучить одну реплику по полу/возрасту."""
-    return dub_from_profile(
-        text, language, {"gender": gender, "age_group": age}, out_path,
-    )
-
-
 def dub_from_profile(text, language, profile, out_path, *, bank_ready=False):
     """Озвучка по casting.json через Fish TTS (clone + emo-теги в тексте)."""
+    _ = language  # язык уже в тексте перевода; клон по сэмплу
     if not (text or "").strip():
         raise ValueError("text пустой")
     profile = apply_voice_override(profile or {})
     if not bank_ready:
-        ensure_voice_bank(language)
+        ensure_voice_bank()
 
     vk = normalize_voice_key(profile)
     rid = _resolve_reference_id(vk)
