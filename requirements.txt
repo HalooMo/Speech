@@ -2,6 +2,8 @@ python-dotenv>=1.0.0
 openai
 demucs
 fish-audio-sdk>=1.3.0
+syncsdk>=0.3.0
+httpx
 transformers>=4.57.3,<5
 torch
 torchaudio

@@ -76,7 +76,7 @@ Output JSON: speech {{"type","start","end","speaker","text"}}, silence {{"type",
         lo_w, hi_w = max(1, int(words * 0.85)), max(1, int(words * 1.15))
         extra = f"\nSpoken duration of the slot is ~{float(slot):.2f}s — keep length speakable in that time." if slot and float(slot) > 0 else ""
         ctx = f"\nContext (neighbor lines):\n{context}\n" if context else ""
-        return f"""Translate "{src}" → "{tgt}" for voice-over dubbing.
+        return f"""Translate "{src}" → "{tgt}" for video dubbing.
 Keep translation length close to the original: ~{lo_c}-{hi_c} chars, ~{lo_w}-{hi_w} words
 (same information density so TTS fits the original timing).{extra}
 {_EMO_HINT}
@@ -89,7 +89,7 @@ Line:
 
     if kind == 3:
         payload = json.dumps(value["lines"], ensure_ascii=False, separators=(",", ":"))
-        return f"""Translate each line {value["source_lang"]} → {value["target_lang"]} for voice-over dubbing.
+        return f"""Translate each line {value["source_lang"]} → {value["target_lang"]} for video dubbing.
 For every line keep translation length close to the original (use source_chars / source_words / slot_sec when present).
 {_EMO_HINT}
 Judge emotion from the full batch context; put tags only in the translated text field.

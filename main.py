@@ -7,7 +7,7 @@
 Поток (сверху вниз в этом файле):
   video → 16k → demucs → first_seg(40–90s) → ASR →
   перевод(+emo tags) → casting → Fish TTS(clone, 44.1k) →
-  fit/timeline/full_dub/mux на OUT_SR (44.1k)
+  [full] Sync lipsync second_seg → fit/timeline/full_dub/mux
 
 Resume (SPEECHLAB_RESUME=1):
   A — demucs/first_seg пропускаются, если vocals+segment хеши в pipeline_state совпали
@@ -170,6 +170,23 @@ def _resume_ok(project_dir, video_path):
     return True
 
 
+def _norm_dub_mode(raw) -> str:
+    """voiceover | full (PRD п.15). Default voiceover."""
+    m = (raw or "voiceover").strip().lower()
+    aliases = {
+        "voiceover": "voiceover",
+        "voice-over": "voiceover",
+        "voice_over": "voiceover",
+        "vo": "voiceover",
+        "full": "full",
+        "full_dub": "full",
+        "fulldub": "full",
+    }
+    if m not in aliases:
+        raise ValueError(f"dub_mode: ожидается voiceover|full, получено {raw!r}")
+    return aliases[m]
+
+
 def _voice_fingerprint(
     *,
     voice_gender=None,
@@ -179,6 +196,7 @@ def _voice_fingerprint(
     cast_mode=None,
     dub_volume_percent=None,
     original_audio_ratio=None,
+    dub_mode=None,
 ) -> str:
     """Отпечаток опций голоса/микса — смена → нельзя resume casting/TTS."""
     clone_meta = []
@@ -197,6 +215,7 @@ def _voice_fingerprint(
         "cast_mode": (cast_mode or "").strip().lower() or None,
         "dub_vol": dub_volume_percent,
         "orig_ratio": original_audio_ratio,
+        "dub_mode": _norm_dub_mode(dub_mode),
         "tts": "fish",
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -583,6 +602,136 @@ def dub_segments(second_seg, target_lang, *, unload=True, bank_ready=False):
         unload_model()
     return final_dir
 
+
+def _extract_video_clip(video_path, start, end, out_mp4):
+    """Вырезать видеоклип [start, end) без аудио (для Sync)."""
+    out_mp4 = Path(out_mp4)
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    dur = max(0.05, float(end) - float(start))
+    _run([
+        "ffmpeg", "-y",
+        "-ss", f"{float(start):.3f}", "-i", str(video_path),
+        "-t", f"{dur:.3f}",
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
+        str(out_mp4),
+    ])
+    return out_mp4
+
+
+def lipsync_second_segs(video_path, primary_dir, primary_start):
+    """PRD: Sync Labs lipsync для каждой speech_* в second_seg (только full)."""
+    from tools.fit_audio import apply_limited_fit
+    from tools.lipsync import lipsync_files
+
+    second = Path(primary_dir) / "second_seg"
+    txt_dir = second / "output_text_segments"
+    fin = second / "final_audio"
+    out_dir = second / "lipsync"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not txt_dir.is_dir() or not fin.is_dir():
+        return out_dir
+
+    base = float(primary_start)
+    for txt in _list_txt(txt_dir):
+        meta = _parse_txt(txt)
+        if not meta:
+            continue
+        dubs = list(fin.glob(f"speech_{_idx(txt.name):03d}_*_dub.wav"))
+        if not dubs:
+            continue
+        dub = dubs[0]
+        out = out_dir / f"{dub.stem}_lipsync.mp4"
+        if out.is_file() and out.stat().st_size > 1000 and out.stat().st_mtime >= dub.stat().st_mtime:
+            print(f"  lipsync {out.name}: resume")
+            continue
+        slot = float(meta["end"]) - float(meta["start"])
+        apply_limited_fit(dub, slot)
+        abs_s = base + float(meta["start"])
+        abs_e = base + float(meta["end"])
+        clip = out_dir / f"{dub.stem}_src.mp4"
+        _extract_video_clip(video_path, abs_s, abs_e, clip)
+        try:
+            lipsync_files(clip, dub, out)
+            print(f"  lipsync {out.name}")
+        except Exception as exc:
+            print(f"  lipsync {txt.name} ошибка: {exc}")
+        finally:
+            clip.unlink(missing_ok=True)
+    return out_dir
+
+
+def assemble_lipsync_video(video_path, project_dir, manifest, out_mp4):
+    """Склеить original gaps + lipsync-клипы second_seg → video-only MP4."""
+    clips = []
+    for item in manifest:
+        primary = project_dir / "first_seg" / item["folder"]
+        base = float(item["start"])
+        lip_dir = primary / "second_seg" / "lipsync"
+        txt_dir = primary / "second_seg" / "output_text_segments"
+        fin = primary / "second_seg" / "final_audio"
+        if not lip_dir.is_dir() or not txt_dir.is_dir():
+            continue
+        for txt in _list_txt(txt_dir):
+            meta = _parse_txt(txt)
+            if not meta:
+                continue
+            dubs = list(fin.glob(f"speech_{_idx(txt.name):03d}_*_dub.wav")) if fin.is_dir() else []
+            if not dubs:
+                continue
+            lip = lip_dir / f"{dubs[0].stem}_lipsync.mp4"
+            if lip.is_file() and lip.stat().st_size > 1000:
+                clips.append((base + float(meta["start"]), base + float(meta["end"]), lip))
+    clips.sort(key=lambda x: x[0])
+
+    if not clips:
+        return None
+
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(video_path)],
+        capture_output=True, text=True,
+    )
+    try:
+        video_dur = float((r.stdout or "").strip())
+    except ValueError:
+        video_dur = clips[-1][1]
+
+    work = Path(out_mp4).parent / "_lipsync_pieces"
+    if work.is_dir():
+        shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
+
+    pieces = []
+    cursor = 0.0
+    for i, (s, e, lip) in enumerate(clips):
+        s = max(s, cursor)
+        if s > cursor + 0.02:
+            gap = work / f"{len(pieces):04d}_gap.mp4"
+            _extract_video_clip(video_path, cursor, s, gap)
+            pieces.append(gap)
+        # lipsync клип без аудио для concat
+        vonly = work / f"{len(pieces):04d}_lip.mp4"
+        _run(["ffmpeg", "-y", "-i", str(lip), "-an", "-c:v", "libx264",
+              "-pix_fmt", "yuv420p", "-preset", "fast", str(vonly)])
+        pieces.append(vonly)
+        cursor = max(cursor, e)
+    if cursor < video_dur - 0.05:
+        gap = work / f"{len(pieces):04d}_gap.mp4"
+        _extract_video_clip(video_path, cursor, video_dur, gap)
+        pieces.append(gap)
+
+    lst = work / "concat.txt"
+    lst.write_text("".join(f"file {json.dumps(str(p.resolve()))}\n" for p in pieces), encoding="utf-8")
+    out_mp4 = Path(out_mp4)
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    _run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(out_mp4),
+    ])
+    shutil.rmtree(work, ignore_errors=True)
+    return out_mp4
+
+
 # =============================================================================
 # Шаги 7–9: склейка, микс, mux (всё на OUT_SR — качество Fish TTS)
 # =============================================================================
@@ -721,6 +870,7 @@ def run(
     hf_token=None,
     dub_volume_percent=None,
     original_audio_ratio=None,
+    dub_mode=None,
     voice_gender=None,
     voice_age=None,
     voice_clone_samples=None,
@@ -743,6 +893,8 @@ def run(
 
     project_dir = _projects_root(projects_root) / project_name
     project_dir.mkdir(parents=True, exist_ok=True)
+
+    dub_mode_n = _norm_dub_mode(dub_mode)
 
     # --- встроенные cast-голоса (data/Cast): один пресет или раздача по спикерам ---
     clone_samples = list(voice_clone_samples or [])
@@ -787,6 +939,7 @@ def run(
         cast_mode=mode,
         dub_volume_percent=dub_volume_percent,
         original_audio_ratio=original_audio_ratio,
+        dub_mode=dub_mode_n,
     )
 
     token = hf_token or get_hf_token()
@@ -937,6 +1090,14 @@ def run(
             dub_segments(second, target_language, unload=False, bank_ready=bank_ready)
         unload_tts()
 
+        # PRD: lipsync каждой second_seg реплики — только full + есть видео
+        if dub_mode_n == "full" and _has_video(video_path):
+            print("=== 6b. Sync Labs lipsync (second_seg) ===")
+            for item in manifest:
+                primary = first_seg_dir / item["folder"]
+                print(f"--- lipsync {item['folder']} ---")
+                lipsync_second_segs(video_path, primary, float(item["start"]))
+
         # --- 7–9 ---
         print(f"=== 7. Склейка реплик @ {OUT_SR} Hz ===")
         for primary, _ in jobs:
@@ -947,12 +1108,28 @@ def run(
 
         print("=== 9. mux MP4 ===")
         mux_audio = project_dir / "final_mux_audio.wav"
-        mix_dub_with_original(
-            video_path, full, mux_audio,
-            original_ratio=original_audio_ratio, dub_volume_percent=dub_volume_percent,
-        )
+        if dub_mode_n == "full":
+            if original_audio_ratio is not None:
+                print("  dub_mode=full: original_audio_ratio игнорируется")
+            shutil.copy2(full, mux_audio)
+            print("  dub_mode=full: без оригинальной дорожки видео")
+        else:
+            mix_dub_with_original(
+                video_path, full, mux_audio,
+                original_ratio=original_audio_ratio, dub_volume_percent=dub_volume_percent,
+            )
+            print("  dub_mode=voiceover")
         out = project_dir / f"{project_name}_dubbed.mp4"
-        mux_video(video_path, mux_audio, out)
+        video_for_mux = video_path
+        if dub_mode_n == "full" and _has_video(video_path):
+            lip_timeline = project_dir / "lipsync_timeline.mp4"
+            built = assemble_lipsync_video(video_path, project_dir, manifest, lip_timeline)
+            if built and built.is_file():
+                video_for_mux = built
+                print(f"  lipsync timeline: {built.name}")
+            else:
+                print("  lipsync timeline: нет клипов — исходное видео")
+        mux_video(video_for_mux, mux_audio, out)
         (project_dir / "dub_output_path.txt").write_text(str(out.resolve()), encoding="utf-8")
         print(f"Готово: {out}")
         return out

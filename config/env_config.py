@@ -46,3 +46,14 @@ def get_fish_tts_api_key():
     if not k:
         raise ValueError("FISH_TTS_API_KEY не задан в config/.env")
     return k
+
+
+def get_sync_api_key():
+    """Sync Labs lipsync (SYNC_LABS_API_KEY / SYNC_API_KEY)."""
+    k = (
+        os.environ.get("SYNC_LABS_API_KEY", "").strip()
+        or os.environ.get("SYNC_API_KEY", "").strip()
+    )
+    if not k:
+        raise ValueError("SYNC_LABS_API_KEY не задан в config/.env")
+    return k

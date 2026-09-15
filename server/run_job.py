@@ -50,6 +50,7 @@ def main() -> int:
             projects_root=cfg.projects_root,
             dub_volume_percent=opts.get("dub_volume_percent"),
             original_audio_ratio=opts.get("original_audio_ratio"),
+            dub_mode=opts.get("dub_mode"),
             voice_gender=opts.get("voice_gender"),
             voice_age=opts.get("voice_age"),
             voice_clone_samples=opts.get("voice_clone_samples"),

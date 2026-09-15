@@ -243,9 +243,9 @@ def _parse_voice_clone_samples(cfg, project_name: str) -> list[dict] | None:
     return samples or None
 
 
-# --- Опции дубляжа: громкость, gender/age override ---
+# --- Опции дубляжа: громкость, gender/age, режим микса ---
 def _parse_options() -> dict:
-    """Опции дубляжа: громкость и override пола/возраста."""
+    """Опции дубляжа: громкость, override пола/возраста, dub_mode."""
     opts = {
         "dub_volume_percent": _opt_float("dub_volume_percent"),
         "original_audio_ratio": _opt_float("original_audio_ratio"),
@@ -255,9 +255,32 @@ def _parse_options() -> dict:
     return {k: v for k, v in opts.items() if v is not None}
 
 
+def _parse_dub_mode() -> str | None:
+    """dub_mode / mode / dubbing_mode → voiceover|full; None = дефолт в main."""
+    raw = _opt_str_any("dub_mode", "mode", "dubbing_mode")
+    if not raw:
+        return None
+    m = raw.strip().lower()
+    aliases = {
+        "voiceover": "voiceover",
+        "voice-over": "voiceover",
+        "voice_over": "voiceover",
+        "vo": "voiceover",
+        "full": "full",
+        "full_dub": "full",
+        "fulldub": "full",
+    }
+    if m not in aliases:
+        raise ValueError(f"dub_mode: ожидается voiceover|full, получено {raw!r}")
+    return aliases[m]
+
+
 # --- Сборка всех опций для передачи в job.options → main.run() ---
 def _merge_options(project_name: str) -> dict:
     opts = _parse_options()
+    dub_mode = _parse_dub_mode()
+    if dub_mode:
+        opts["dub_mode"] = dub_mode
     clone_samples = _parse_voice_clone_samples(_cfg(), project_name)
     if clone_samples:
         opts["voice_clone_samples"] = clone_samples
@@ -315,8 +338,9 @@ def create_dub():
       cast_mode=speakers — раздать cast-голоса по спикерам
 
     Опционально:
+      dub_mode — voiceover (дефолт: микс с оригиналом ~30%) | full (только full_dub)
       voice_gender / voice_age — override casting
-      dub_volume_percent / original_audio_ratio — микс
+      dub_volume_percent / original_audio_ratio — микс (ratio только для voiceover)
     """
     cfg = _cfg()
     store = _store()
